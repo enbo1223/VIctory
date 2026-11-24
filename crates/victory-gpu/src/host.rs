@@ -247,8 +247,6 @@ fn recommended_wave64_mode(device: &ID3D12Device) -> victory_shader::emit::Wave6
     }
     if opts.WaveLaneCountMin <= 64 && opts.WaveLaneCountMax >= 64 {
         Wave64Mode::Native
-    } else if opts.WaveLaneCountMin <= 32 && opts.WaveLaneCountMax >= 32 {
-        Wave64Mode::Wave32
     } else {
         Wave64Mode::Emulate
     }

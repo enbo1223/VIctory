@@ -142,11 +142,13 @@ impl Host {
     }
 
     /// Best Wave64 compute lowering strategy supported by this host device.
+    ///
+    /// Hosts without native 64-lane waves default to [`Wave64Mode::Emulate`],
+    /// which keeps non-lane-dependent shaders native while avoiding `Wave32`
+    /// divergent/cross-half miscompilations (`Wave32` remains opt-in).
     pub fn recommended_wave64_mode(&self) -> Wave64Mode {
         if self.supports_wave64() {
             Wave64Mode::Native
-        } else if self.supports_wave32() {
-            Wave64Mode::Wave32
         } else {
             Wave64Mode::Emulate
         }
@@ -1465,8 +1467,6 @@ mod tests {
             let mode = h.recommended_wave64_mode();
             let expected = if h.supports_wave64() {
                 Wave64Mode::Native
-            } else if h.supports_wave32() {
-                Wave64Mode::Wave32
             } else {
                 Wave64Mode::Emulate
             };
