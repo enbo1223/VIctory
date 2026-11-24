@@ -1,4 +1,4 @@
-//! IR to DXIL, one machine instruction at a time (decision 0003).
+﻿//! IR to DXIL, one machine instruction at a time (decision 0003).
 //!
 //! Every register dword is an `i32` (SCC an `i1`); float operations bitcast
 //! their operands. Lane masks exist only as the per-lane booleans of
@@ -149,6 +149,14 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
 fn half_shift(width: u32) -> u32 {
     debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
     if width == 16 { 0 } else { 15 - width }
+}
+
+/// The four words of an immediate sampler.
+fn sampler_words(words: &[u32]) -> Result<[u32; 4], Why> {
+    words
+        .get(..4)
+        .and_then(|w| w.try_into().ok())
+        .ok_or("a sampler constant")
 }
 
 struct Lower<'a> {
@@ -2703,7 +2711,7 @@ impl<'a> Lower<'a> {
     /// +0 on the hardware, where the host's function of the rounded angle
     /// gives about 1e-7. Infinities and NaN give NaN.
     /// shortcut: below 2^-12 turns the hardware scales by a slightly
-    /// different constant than 2π (a last-place difference).
+    /// different constant than 2Ï€ (a last-place difference).
     fn trig_turns(&mut self, x: V, cosine: bool) -> V {
         let c = self.cur;
         let zero = self.s.m.f32(0);
@@ -2721,7 +2729,7 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 Ã— 32-bit product.
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
         let i64t = self.s.m.int(64);
@@ -2735,7 +2743,7 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 Ã— anything = 0`, as in D3D9.
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
         let m = self.s.m.bin(c, Bin::Mul, a, b);
@@ -3356,7 +3364,7 @@ impl<'a> Lower<'a> {
             _ => 1,
         };
         // (byte offset, dwords) per element; read2/write2 scale their two
-        // offsets by the element size (×64 for st64).
+        // offsets by the element size (Ã—64 for st64).
         let pair = |n: &str| -> Vec<(u32, u32)> {
             let w = width(n);
             let scale = 4 * w * if n.contains("st64") { 64 } else { 1 };
@@ -4627,23 +4635,8 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Constant(words) if sampler => {
-                let words: [u32; 4] = words
-                    .get(..4)
-                    .and_then(|w| w.try_into().ok())
-                    .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
-                    Some(n) => n,
-                    None => {
-                        self.samplers.push(words);
-                        self.samplers.len() - 1
-                    }
-                };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
-                Ok(self.s.sampler_handle(self.cur, n as u32))
+                let words = sampler_words(words)?;
+                self.immediate_sampler(words, props)
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
             Source::Built { address, .. } => {
@@ -4730,6 +4723,92 @@ impl<'a> Lower<'a> {
             }
             _ => Err("a descriptor chosen by control flow"),
         }
+    /// The handle of the immediate sampler `words` (a static sampler).
+    fn immediate_sampler(&mut self, words: [u32; 4], props: (u32, u32)) -> Result<V, Why> {
+        let n = match self.samplers.iter().position(|w| *w == words) {
+            Some(n) => n,
+            None => {
+                self.samplers.push(words);
+                self.samplers.len() - 1
+            }
+        };
+        if props.0 & 0x8000 != 0 {
+            // shortcut: one sampler used with and without comparison
+            // would need two static samplers; it becomes a comparison one.
+            self.s.cmp_samplers |= 1 << n;
+        }
+        Ok(self.s.sampler_handle(self.cur, n as u32))
+    }
+
+    /// The handles of the sampler `src` read at `site`, and which one each
+    /// lane uses: one handle, or, for immediate samplers control flow chose
+    /// among (each predecessor of the join naming a constant one), one per
+    /// choice and the choice's position, picked at the join. Static samplers
+    /// are one register each, so no shader array can index them; the
+    /// sampling instruction runs once per choice and [`Lower::picked`] takes
+    /// the chosen result. The choice is uniform, as the edge is.
+    fn sampler_choice(
+        &mut self,
+        site: Site,
+        src: &Source,
+        props: (u32, u32),
+    ) -> Result<(Vec<V>, Option<V>), Why> {
+        let Source::Phi { block, args } = src else {
+            return Ok((vec![self.handle(site, src, true, props)?], None));
+        };
+        if !args.iter().all(|a| matches!(a, Source::Constant(_))) {
+            return Ok((vec![self.handle(site, src, true, props)?], None));
+        }
+        let mut edges = Vec::new();
+        let mut choices: Vec<[u32; 4]> = Vec::new();
+        for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
+            if self.block[q].is_none() {
+                continue;
+            }
+            let Source::Constant(words) = arg else {
+                unreachable!("checked above");
+            };
+            let words = sampler_words(words)?;
+            let tail = self.tail[q].ok_or("a descriptor chosen by control flow")?;
+            let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
+            let k = match choices.iter().position(|c| *c == words) {
+                Some(k) => k,
+                None => {
+                    choices.push(words);
+                    choices.len() - 1
+                }
+            };
+            edges.push((at, k));
+        }
+        let mut handles = Vec::new();
+        for words in &choices {
+            handles.push(self.immediate_sampler(*words, props)?);
+        }
+        if handles.len() < 2 {
+            return Ok((handles, None));
+        }
+        let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
+        let mut incoming = Vec::new();
+        for (at, k) in edges {
+            incoming.push((self.s.m.i32(k as u32), at));
+        }
+        let phi = self.s.m.phi(join, self.s.t.i32);
+        self.s.m.set_phi(phi, incoming);
+        Ok((handles, Some(phi)))
+    }
+
+    /// Of `xs`, one value per handle [`Lower::sampler_choice`] gave, the one
+    /// at position `pick` (the first without one).
+    fn picked(&mut self, c: usize, pick: Option<V>, xs: &[V]) -> V {
+        let mut x = xs[0];
+        if let Some(pick) = pick {
+            for (k, &other) in xs.iter().enumerate().skip(1) {
+                let k = self.s.m.i32(k as u32);
+                let here = self.s.m.cmp(c, pred::EQ, pick, k);
+                x = self.s.m.select(c, here, other, x);
+            }
+        }
+        x
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -7315,7 +7394,7 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let r = if sample {
+        let (rs, pick) = if sample {
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -7327,7 +7406,8 @@ impl<'a> Lower<'a> {
             if cmp && (*a16 || dmask.count_ones() != 1) {
                 return Err("a comparison sample of 16-bit coordinates or several channels");
             }
-            let sh = self.handle(site, ss, true, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
+            let (shs, pick) =
+                self.sampler_choice(site, ss, (14 | if cmp { 0x8000 } else { 0 }, 0))?;
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
@@ -7380,14 +7460,18 @@ impl<'a> Lower<'a> {
                 let f32t = self.s.t.f32;
                 for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
                     let clamped = self.s.m.bool(ch == 0);
-                    let lod = self.s.op(
-                        c,
-                        "calculateLOD.f32",
-                        Attr::ReadOnly,
-                        f32t,
-                        81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
-                    );
+                    let mut lods = Vec::new();
+                    for &sh in &shs {
+                        lods.push(self.s.op(
+                            c,
+                            "calculateLOD.f32",
+                            Attr::ReadOnly,
+                            f32t,
+                            81,
+                            &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        ));
+                    }
+                    let lod = self.picked(c, pick, &lods);
                     let x = self.as_int(lod);
                     self.write(inst, Reg::V(reg + k as u8), x, guard);
                 }
@@ -7403,9 +7487,9 @@ impl<'a> Lower<'a> {
             for o in os.iter_mut().take(offsets) {
                 *o = zero;
             }
-            let mut args = vec![h, sh];
+            let mut args = vec![h, shs[0]];
             args.extend(&cs);
-            match op {
+            let (dx, dx_op) = match op {
                 60 => {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
@@ -7428,22 +7512,14 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os);
                     args.push(fu);
-                    self.s
-                        .op(c, "sample.f32", Attr::ReadOnly, self.s.t.res_ret, 60, &args)
+                    ("sample.f32", 60)
                 }
                 61 => {
                     let bias = addr_val(self, 0)?;
                     let bias = self.as_float(bias);
                     args.extend(&os);
                     args.extend([bias, fu]);
-                    self.s.op(
-                        c,
-                        "sampleBias.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        61,
-                        &args,
-                    )
+                    ("sampleBias.f32", 61)
                 }
                 63 => {
                     let mut g = vec![fu; 6];
@@ -7456,14 +7532,7 @@ impl<'a> Lower<'a> {
                     args.extend(&os);
                     args.extend(g);
                     args.push(fu);
-                    self.s.op(
-                        c,
-                        "sampleGrad.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        63,
-                        &args,
-                    )
+                    ("sampleGrad.f32", 63)
                 }
                 64 | 65 => {
                     let reference = addr_val(self, first - 1)?;
@@ -7476,8 +7545,7 @@ impl<'a> Lower<'a> {
                     } else {
                         "sampleCmpLevelZero.f32"
                     };
-                    self.s
-                        .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
+                    (name, op)
                 }
                 62 => {
                     let lod = if name == "image_sample_l" {
@@ -7488,14 +7556,7 @@ impl<'a> Lower<'a> {
                     };
                     args.extend(&os);
                     args.push(lod);
-                    self.s.op(
-                        c,
-                        "sampleLevel.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        62,
-                        &args,
-                    )
+                    ("sampleLevel.f32", 62)
                 }
                 _ => {
                     if name == "image_gather4" {
@@ -7516,16 +7577,19 @@ impl<'a> Lower<'a> {
                     }
                     args.extend(&os[..2]);
                     args.push(self.s.m.i32(dmask.trailing_zeros()));
-                    self.s.op(
-                        c,
-                        "textureGather.f32",
-                        Attr::ReadOnly,
-                        self.s.t.res_ret,
-                        73,
-                        &args,
-                    )
+                    ("textureGather.f32", 73)
                 }
+            };
+            // One sample per sampler choice (see `sampler_choice`).
+            let mut rs = Vec::new();
+            for &sh in &shs {
+                args[1] = sh;
+                rs.push(
+                    self.s
+                        .op(c, dx, Attr::ReadOnly, self.s.t.res_ret, dx_op, &args),
+                );
             }
+            (rs, pick)
         } else {
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -7543,14 +7607,15 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
+            let r = self.s.op(
                 c,
                 "textureLoad.f32",
                 Attr::ReadOnly,
                 self.s.t.res_ret,
                 66,
                 &args,
-            )
+            );
+            (vec![r], None)
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
@@ -7562,7 +7627,11 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+            let mut each = Vec::new();
+            for &r in &rs {
+                each.push(self.s.m.extract(c, r, ch));
+            }
+            let x = self.picked(c, pick, &each);
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
@@ -7598,7 +7667,7 @@ impl<'a> Lower<'a> {
     /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
     /// host's cube sampling turns back into the same texel.
     // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    // operand adds 8 Ã— the slice).
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());

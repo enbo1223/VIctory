@@ -85,6 +85,8 @@ mod lower;
 #[cfg(test)]
 mod mtbuf_tests;
 mod sampler;
+#[cfg(all(test, windows))]
+mod sampler_tests;
 mod shader;
 #[cfg(windows)]
 pub mod validator;
