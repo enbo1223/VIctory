@@ -168,10 +168,20 @@ With the community fixes merged here (mirrored heap slots the title writes,
 bounded one-view root SRV tables, aligned CBV tables that no longer exhaust
 the capped dynamic range, and guarded `OMSetRenderTargets` ranges), a world
 run on an RTX 4060 with `VICTORY_D3D12_DRED=1` stayed up for 160 seconds and
-rendered frames of the world. It is still slow (0.4–0.8 fps) and still drops
-draws whose shaders do not translate; those are translation limits, not device
-loss. A profile selector before the world can be passed in unattended runs
-with `VICTORY_KEYS_AS_PAD=1`.
+rendered frames of the world.
+
+Console compute programs that declare `WaveSize(64)` cannot become host
+pipelines on 32-lane hosts (NVIDIA reports a wave range of 32..32): the host
+refused them with `0x80070057` and dropped their dispatches. Translation now
+queries `D3D12_FEATURE_D3D12_OPTIONS1` and lowers those programs to wave32 /
+emulated wave64 automatically; no switch is needed. On an RTX 4060 Laptop this
+removed all 120 pipeline refusals. A full run with `VICTORY_D3D12_DRED=1` then
+survived the whole 240-second test window with **0 device removals** and
+captured real world frames. World rendering is still slow (0.4–0.9 fps) and
+still drops draws whose host pipelines are not ready or whose shaders do not
+translate; those are translation limits, not device loss. A profile selector
+before the world can be passed in unattended runs with
+`VICTORY_KEYS_AS_PAD=1`.
 
 ## License
 
