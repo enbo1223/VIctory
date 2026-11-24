@@ -708,11 +708,15 @@ impl State {
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
-    /// constant buffer are made afresh for the draw in dynamic slots, with
-    /// the constant data copied to upload memory when the list is
-    /// submitted: the host wants constant buffers 256-byte aligned, the
-    /// console only 16. Returns those tables' new byte offsets by root
-    /// parameter; the other tables' slots are made from the title's.
+    /// constant buffer that is not 256-byte aligned on the host (or whose
+    /// 256-byte-padded range leaves its shadow buffer) are made afresh for
+    /// the draw in dynamic slots, with the constant data copied to upload
+    /// memory when the list is submitted: the host wants constant buffers
+    /// 256-byte aligned, the console only 16. Tables whose constant buffers
+    /// already meet the host's alignment mirror straight into the title's
+    /// own heap slots, avoiding dynamic slot churn on capped view heaps.
+    /// Returns the fresh tables' new byte offsets by root parameter; the
+    /// other tables' slots are made from the title's.
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once: its constant data is copied at submission either way, and the
@@ -720,12 +724,39 @@ impl State {
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
     fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
+        let mut fresh: Vec<u8> = Vec::new();
+        let mut cbv_slots: Vec<u8> = used
             .iter()
             .filter(tables)
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
+        cbv_slots.sort_unstable();
+        cbv_slots.dedup();
+        for slot in cbv_slots {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let n = used
+                .iter()
+                .filter(tables)
+                .filter(|u| u.slot == slot)
+                .map(|u| u.table_offset_dwords / 8 + 1)
+                .max()
+                .unwrap_or(1);
+            let needs_fresh = (0..n).any(|k| {
+                matches!(
+                    crate::descriptor::view(table + u64::from(k) * 32),
+                    Some(View::Constant(address, size))
+                        if size == 0
+                            || !crate::shadow::find(address, u64::from(size.next_multiple_of(256)))
+                                .is_some_and(|s| s.gpu(address).is_multiple_of(256))
+                )
+            });
+            if needs_fresh {
+                fresh.push(slot);
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -1217,6 +1248,11 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             crate::capture::note_target(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
+        (&View::Constant(address, size), ResourceType::Cbv) if size > 0 => {
+            if let Some(shadow) = crate::shadow::find(address, u64::from(size)) {
+                shadow.refresh(list, address, u64::from(size));
+            }
+        }
         _ => {}
     }
 }
@@ -1287,4 +1323,108 @@ pub(crate) fn blend_factor(list: &HostList, factor: Option<&[f32; 4]>) {
 pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
     // SAFETY: an open list.
     unsafe { list.list.OMSetStencilRef(reference) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object::{S_OK, slot};
+
+    #[test]
+    fn aligned_cbv_tables_mirror_in_place_without_dynamic_slots() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("host list");
+        let null: This = std::ptr::null();
+
+        // Create a shader-visible view heap with 8 title slots (plain desc + zero placement tail).
+        let mut heap_obj: This = null;
+        let desc = [0u32, 8, 1, 0, 0, 0, 0, 0]; // CBV_SRV_UAV, count=8, SHADER_VISIBLE, node=0 + zero tail
+        let heap_iid = ID3D12DescriptorHeap::IID;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                null,
+                desc.as_ptr().cast(),
+                std::ptr::from_ref(&heap_iid).cast(),
+                &mut heap_obj,
+            ),
+            S_OK
+        );
+        let heap_start = slot::<extern "system" fn(This) -> u64>(heap_obj, 0x48)(heap_obj);
+
+        // Create a 4096-byte committed buffer so its shadow buffer is 256-byte aligned.
+        let props = [2u32, 0, 0, 0, 0]; // UPLOAD heap
+        let buf_desc = [
+            1u32, // BUFFER
+            0, 0, 0, 4096, 0, // alignment=0, width=4096
+            1, 0x0001_0001, 0, 1, 0, 1, 0, 0,
+        ];
+        let mut buf: This = null;
+        let res_iid = ID3D12Resource::IID;
+        assert_eq!(
+            crate::resource::create_committed(
+                null,
+                props.as_ptr().cast(),
+                0,
+                buf_desc.as_ptr().cast(),
+                0,
+                null.cast(),
+                std::ptr::from_ref(&res_iid).cast(),
+                &mut buf,
+            ),
+            S_OK
+        );
+        let (data, len) = crate::resource::buffer_bytes(buf).expect("buffer bytes");
+        assert!(len >= 4096);
+        let base = data as u64;
+
+        let write_cbv = |slot_idx: u64, addr: u64, size: u32| {
+            let cbv = [addr as u32, (addr >> 32) as u32, size, 0];
+            crate::descriptor::create_cbv(null, &cbv, heap_start + slot_idx * 32);
+        };
+        // Slot 0: 256-byte aligned CBV within shadow bounds -> mirrors in place.
+        write_cbv(0, base, 256);
+        // Slot 1: 16-byte aligned (misaligned for PC) CBV -> needs dynamic slots.
+        write_cbv(1, base + 16, 256);
+        // Slot 2: 256-byte aligned start, but padded 256-byte size runs past shadow end -> needs dynamic slots.
+        write_cbv(2, base + 4096 - 128, 128);
+
+        let used = [UsedResource {
+            kind: ResourceType::Cbv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }];
+
+        let mut state = State::default();
+        state.set_heaps(&[heap_obj]);
+
+        // 1) Aligned CBV table: zero dynamic slots allocated, not remapped.
+        state.set_table(false, 0, heap_start);
+        let made = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert!(made.is_empty(), "aligned CBV table should not allocate dynamic slots");
+        assert!(state.dynamic.is_empty());
+
+        // 2) Misaligned (+16) CBV table: allocates dynamic slots.
+        state.set_table(false, 0, heap_start + 32);
+        let made = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(made.len(), 1, "misaligned CBV table must use dynamic slots");
+        assert_eq!(state.dynamic.len(), 1);
+
+        // 3) CBV whose 256-byte-padded size exceeds shadow end: allocates dynamic slots.
+        state.set_table(false, 0, heap_start + 64);
+        let made = state.tables(&list, &used, false);
+        assert!(!state.table_failed);
+        assert_eq!(made.len(), 1, "CBV padded past shadow end must use dynamic slots");
+        assert_eq!(state.dynamic.len(), 2);
+
+        list.close();
+    }
 }
