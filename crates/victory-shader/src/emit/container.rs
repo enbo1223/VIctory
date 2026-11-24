@@ -44,6 +44,7 @@ impl SigElement {
             18 => 68,
             19 => 67,
             20 => 69,
+            28 => 26, // barycentrics (SV_Barycentrics)
             30 => 25, // cull primitive
             _ => 0,
         }

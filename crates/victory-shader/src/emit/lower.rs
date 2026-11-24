@@ -2156,6 +2156,39 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A system-value input with an explicit semantic: kind, name, component,
+    /// column count. SV_Barycentrics (kind 28) is a float3 input read via
+    /// loadInput (DXIL 1.1 / SM 6.6), no AttributeAtVertex needed.
+    fn system_input(&mut self, kind: u8, name: &str, index: u8, comp: u8, cols: u8) -> Val {
+        let id = match self.s.inputs.iter().position(|e| e.kind == kind) {
+            Some(id) => id,
+            None => {
+                let row = self
+                    .s
+                    .inputs
+                    .iter()
+                    .filter_map(|e| e.row)
+                    .map(|r| r + 1)
+                    .max()
+                    .unwrap_or(0);
+                self.s.inputs.push(SigElement {
+                    name: name.into(),
+                    index: 0,
+                    kind,
+                    comp,
+                    interp: 1,
+                    row: Some(row),
+                    col: 0,
+                    cols,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.load_input(id, index)
+    }
+
     fn input(&mut self, input: Input) -> Val {
         let (kind, col) = match input {
             Input::VertexId => (1, 0),
@@ -2167,7 +2200,12 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { index, .. } => {
+                // SV_Barycentrics is a native D3D12 input (semantic kind 28),
+                // a float3 (i, j, w). Read component `index` via loadInput.
+                self.s.flags |= flags::BARYCENTRICS;
+                return self.system_input(28, "SV_Barycentrics", index, 9, 3);
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
