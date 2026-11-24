@@ -190,14 +190,21 @@ fn run_cases_on(
     backends: &[(&str, bool)],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
-    run_output_cases(shader, cases, 1, |backend, i, inputs, out| {
-        check(backend, i, inputs, out[0]);
-    });
+    run_output_cases(
+        shader,
+        cases,
+        backends,
+        1,
+        |backend, i, inputs, out| {
+            check(backend, i, inputs, out[0]);
+        },
+    );
 }
 
 fn run_output_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    backends: &[(&str, bool)],
     output_dwords: u32,
     mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
 ) {
@@ -1090,6 +1097,7 @@ fn check_lds_paired_write(name: &str, write_op: u32, width: usize, stride64: boo
         run_output_cases(
             &shader,
             &[inputs],
+            &[("hardware", false), ("warp", true)],
             LANES * DWORDS_PER_LANE as u32,
             |backend, _, _, out| {
                 let second = if same_offset { 0 } else { width };
@@ -1155,4 +1163,3 @@ fn v_cndmask_on_an_untracked_mask_tests_this_lanes_bit() {
         });
     }
 }
->>>>>>> 48a41fb (Shaders: a select or carry-in on an untracked mask tests this lane's bit)

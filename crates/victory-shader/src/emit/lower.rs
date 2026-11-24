@@ -2390,6 +2390,22 @@ impl<'a> Lower<'a> {
         if let Some(&why) = self.ballot_fail.get(&lo) {
             return Err(why);
         }
+        let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
+        if m == crate::structure::Bool::FALSE {
+            return Ok(self.s.m.i32(0));
+        }
+        if m == crate::structure::Bool::TRUE {
+            return Ok(self.s.m.i32(u32::MAX));
+        }
+        if let Some((
+            crate::structure::Atom::Constant(k),
+            crate::structure::Bool::FALSE,
+            crate::structure::Bool::TRUE,
+        )) = self.x.st.bools.node(m)
+        {
+            let val = if high { (k >> 32) as u32 } else { k as u32 };
+            return Ok(self.s.m.i32(val));
+        }
         let (x, y) = match self.ballots.get(&lo) {
             Some(&xy) => xy,
             None => {
@@ -2406,15 +2422,11 @@ impl<'a> Lower<'a> {
                         _ => return Err("a lane mask written after its use"),
                     }
                 } else {
-                    let &m = self.x.st.masks.get(&lo).ok_or(LANE_MASK)?;
-                    if !self.x.st.active.contains(&lo) {
-                        return Err("a lane mask holding lanes elsewhere read as data");
-                    }
                     let at = match self.def_block.get(&lo) {
                         // Program inputs (EXEC on entry).
                         None => self.s.entry,
                         Some(&b) if b == self.cur_ir => self.cur,
-                        Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                        Some(&b) => self.tail[b].unwrap_or(self.cur),
                     };
                     if !self.balloting.insert(lo) {
                         return Err("a lane mask whose lanes depend on its own value");
@@ -2840,9 +2852,8 @@ impl<'a> Lower<'a> {
             // lanes it adds only feed derivatives, and exports keep their own
             // masks. Wrong if such a section had a side effect.
             Atom::Quad(_) => Ok(self.s.m.bool(true)),
-            // With console lanes, a mask held as a number is the console's:
-            // the lane tests its own bit.
-            Atom::Opaque(v) if self.console_lanes => {
+            // A mask held as a number: the lane tests its own bit via waveGetLaneIndex.
+            Atom::Opaque(v) => {
                 let hi = match self.pair_high(v) {
                     Some(h) => Some(self.get(h)?),
                     None => None,
@@ -2860,13 +2871,11 @@ impl<'a> Lower<'a> {
             Atom::Constant(k) if k == u64::MAX || (!self.x.native.wave64 && k as u32 == u32::MAX) => {
                 Ok(self.s.m.bool(true))
             }
-            Atom::Constant(k) if self.console_lanes => {
+            Atom::Constant(k) => {
                 let lo = self.s.m.i32(k as u32);
                 let hi = self.s.m.i32((k >> 32) as u32);
                 Ok(self.lane_bit(at, lo, Some(hi)))
             }
-            Atom::Opaque(_) => Err("an opaque lane mask"),
-            Atom::Constant(_) => Err("a constant lane mask"),
         }
     }
 
@@ -2904,7 +2913,6 @@ impl<'a> Lower<'a> {
                 } else {
                     None
                 };
-                self.s.flags |= flags::WAVE_OPS;
                 Ok(self.lane_bit(at, lo, hi))
             }
             _ => Err(err),
@@ -2916,6 +2924,7 @@ impl<'a> Lower<'a> {
         let lane = if self.s.threads.is_some() && self.emulating_wave64() {
             self.ensure_wave_ids().1
         } else {
+            self.s.flags |= flags::WAVE_OPS;
             self.s.op(
                 at,
                 "waveGetLaneIndex",
@@ -3533,16 +3542,22 @@ impl<'a> Lower<'a> {
         let name = inst.name();
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
-            MaskData::Host => {
+            MaskData::Host | MaskData::None => {
                 name.starts_with("s_bcnt1_i32_")
                     || name.starts_with("s_ff1_i32_")
                     || name.starts_with("v_mbcnt_")
+                    || name.starts_with("s_mov_")
+                    || name.starts_with("s_and_")
+                    || name.starts_with("s_or_")
+                    || name.starts_with("s_xor_")
+                    || name.starts_with("s_andn2_")
+                    || name.starts_with("s_orn2_")
+                    || name.starts_with("s_bitcmp")
                     || matches!(
                         name,
                         "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
                     )
             }
-            MaskData::None => false,
         };
         if self.emulating_wave64() {
             self.materialize_masks(b, i, inst);
@@ -9104,6 +9119,28 @@ mod tests {
             let words: Vec<u32> = head.iter().chain(&tail).copied().collect();
             lowers(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn lane_mask_reads_as_data_lowers() {
+        let words = [
+            0x7C04_0300, // v_cmp_eq_u32_e32 v0, v1
+            0xBE82_036A, // s_mov_b32 s2, vcc_lo (106)
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).unwrap();
+    }
+
+    #[test]
+    fn readlane_and_writelane_lower() {
+        let words = [
+            0xD761_0000,
+            0x0001_0600, // v_writelane_b32 v0, s0, 3
+            0xD760_0002,
+            0x0001_0700, // v_readlane_b32 s2, v0, 3
+            S_ENDPGM,
+        ];
+        lowers(&words, 0).unwrap();
     }
 
     #[test]
