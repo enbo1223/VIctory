@@ -4741,6 +4741,8 @@ impl<'a> Lower<'a> {
             }
             _ => Err("a descriptor chosen by control flow"),
         }
+    }
+
     /// The handle of the immediate sampler `words` (a static sampler).
     fn immediate_sampler(&mut self, words: [u32; 4], props: (u32, u32)) -> Result<V, Why> {
         let n = match self.samplers.iter().position(|w| *w == words) {
