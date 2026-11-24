@@ -118,6 +118,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_KEYS_AS_PAD=1` | with the above, scripted keys also press buttons on the pad the title reads, even if a real pad holds slot 0 (a keyboard fallback alone is only created when no pad is connected) |
 | `VICTORY_RUMBLE_TEST=1` | with a DualSense on HID, plays a 1.5 s startup pattern (both motors, then trigger resistance, then all four together); no title or menu needed |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
+| `VICTORY_PRESENT_1440P=1` | diagnostics: present the world's 2560x1440 target instead of the title's black 4K upscale plane |
+| `VICTORY_PRESENT_1080P=1` | size the presentation window to 1920x1080; the host scales the presented surface to it |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
 | `VICTORY_D3D12_DEBUG=1` | host debug layer |

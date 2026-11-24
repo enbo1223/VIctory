@@ -290,7 +290,33 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        let fallback = crate::capture::take_1440p_target();
+        #[cfg(all(windows, feature = "diagnostics"))]
+        let (source, source_state) = match &fallback {
+            Some(copy) => {
+                use windows::core::Interface;
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    // SAFETY: a live host texture.
+                    let d = unsafe { copy.texture.GetDesc() };
+                    tracing::info!(
+                        width = d.Width,
+                        height = d.Height,
+                        format = d.Format.0,
+                        "VICTORY_PRESENT_1440P: presenting the world target as plane 0"
+                    );
+                });
+                (
+                    &copy.texture,
+                    copy.state.load(std::sync::atomic::Ordering::Relaxed),
+                )
+            }
+            None => (texture, state),
+        };
+        #[cfg(not(all(windows, feature = "diagnostics")))]
+        let (source, source_state) = (texture, state);
+        let shown = host.present(source, source_state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

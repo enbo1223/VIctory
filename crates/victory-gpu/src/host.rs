@@ -31,6 +31,15 @@ pub(crate) fn texture_state(state: u32) -> u32 {
     pc_state(state) & !BUFFER_ONLY
 }
 
+/// With `VICTORY_PRESENT_1080P` set, size the presentation window to
+/// 1920x1080. The swap chain keeps the source texture's size so the copy in
+/// `present` stays a same-size copy; Windows scales the presented buffer to
+/// the window's client area.
+fn forced_1080p() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_1080P").is_some())
+}
+
 /// Render target views live only until their command is recorded, so a
 /// ring of host descriptors is enough.
 const RTV_RING: u32 = 1024;
@@ -1705,6 +1714,21 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        if forced_1080p() {
+            // SAFETY: a live window handle of ours.
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    0,
+                    0,
+                    1920,
+                    1080,
+                    SWP_NOMOVE | SWP_NOZORDER,
+                );
+            }
+            tracing::info!("VICTORY_PRESENT_1080P: window sized to 1920x1080");
+        }
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
