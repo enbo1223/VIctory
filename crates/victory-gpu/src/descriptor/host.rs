@@ -98,6 +98,7 @@ impl HostHeap {
         };
         // The larger dynamic range only where the host takes it on top of
         // every title slot; else the smaller one, and the cap after that.
+        let requested = count;
         let (heap, count, extra) = if sampler {
             let supported = count.min(PORTABLE_SAMPLERS);
             if supported < count {
@@ -138,7 +139,7 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
+        tracing::debug!(requested, count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
