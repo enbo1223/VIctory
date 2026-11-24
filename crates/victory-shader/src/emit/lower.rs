@@ -7552,7 +7552,11 @@ impl<'a> Lower<'a> {
             self.end_guarded(at, &[]);
             return Ok(());
         }
+        // DXIL has no explicit-LOD gather. Emulate gather4_l with four
+        // textureLoad calls at the rounded mip (Leonida rdna2spirv.py:13384).
+        let gather4_l = matches!(name, "image_gather4_l" | "image_gather4_l_o");
         let (op, sample) = match name {
+            "image_gather4_l" | "image_gather4_l_o" => (66, false),
             "image_sample" | "image_sample_o" => (60, true),
             "image_sample_lz" | "image_sample_l" => (62, true),
             "image_sample_b" => (61, true),
@@ -7606,7 +7610,58 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let (rs, pick) = if sample {
+        let (rs, pick) = if gather4_l {
+            // gather4_l: texel coordinates are u,v followed by LOD; a16 packs
+            // them as f16 halves in successive VGPRs.
+            let lod_addr = 2;
+            let channel = dmask.trailing_zeros();
+            let to_f = |l: &mut Self, x: V| {
+                if *a16 {
+                    let f = l.s.t.f32;
+                    l.s.op(l.cur, "legacyF16ToF32", Attr::ReadNone, f, 131, &[x])
+                } else {
+                    l.as_float(x)
+                }
+            };
+            let raw: Vec<V> = (0..=lod_addr)
+                .map(|k| addr_val(self, k).unwrap())
+                .collect();
+            let coords_vals: Vec<V> = raw[..2].iter().map(|&v| to_f(self, v)).collect();
+            let lod = to_f(self, raw[lod_addr]);
+            let (dims, mip) = gather_dimensions(self, c, h, lod);
+            // floor(u*size - 0.5), gather order: (x0,y1),(x1,y1),(x1,y0),(x0,y0)
+            let half = self.s.m.f32(0.5f32.to_bits());
+            let size0 = self.s.m.extract(c, dims, 0);
+            let size1 = self.s.m.extract(c, dims, 1);
+            let sf0 = self.s.m.cast(c, Cast::UiToFp, size0, self.s.t.f32);
+            let sf1 = self.s.m.cast(c, Cast::UiToFp, size1, self.s.t.f32);
+            let mul0 = self.s.m.bin(c, Bin::Mul, coords_vals[0], sf0);
+            let mul1 = self.s.m.bin(c, Bin::Mul, coords_vals[1], sf1);
+            let base0 = self.s.m.bin(c, Bin::Sub, mul0, half);
+            let base1 = self.s.m.bin(c, Bin::Sub, mul1, half);
+            let f32t = self.s.t.f32;
+            let fl0 = self.s.op(c, "unary.f32", Attr::ReadNone, f32t, 27, &[base0]);
+            let fl1 = self.s.op(c, "unary.f32", Attr::ReadNone, f32t, 27, &[base1]);
+            let i0 = self.s.m.cast(c, Cast::FpToSi, fl0, self.s.t.i32);
+            let i1 = self.s.m.cast(c, Cast::FpToSi, fl1, self.s.t.i32);
+            let one = self.s.m.i32(1);
+            let x0 = i0;
+            let x1 = self.s.m.bin(c, Bin::Add, i0, one);
+            let y0 = i1;
+            let y1 = self.s.m.bin(c, Bin::Add, i1, one);
+            let taps = [(x0, y1), (x1, y1), (x1, y0), (x0, y0)];
+            let z = self.s.m.i32(0);
+            let mut values = Vec::new();
+            for (x, y) in taps {
+                let args = [h, mip, x, y, z, iu, iu, iu];
+                let texel = self
+                    .s
+                    .op(c, "textureLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 66, &args);
+                values.push(self.s.m.extract(c, texel, channel));
+            }
+            let out = self.s.m.aggregate(self.s.t.res_ret, &values);
+            (vec![out], None)
+        } else if sample {
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -7832,7 +7887,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        let channels: Vec<u32> = if op == 73 {
+        let channels: Vec<u32> = if op == 73 || gather4_l {
             vec![0, 1, 2, 3]
         } else {
             (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
@@ -8735,9 +8790,58 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// The rounded mip and dimensions of `h` at an explicit LOD.
+fn gather_dimensions<'a>(
+    l: &mut Lower<'a>,
+    block: usize,
+    h: V,
+    lod: V,
+) -> (V, V) {
+    let (f32t, i32t) = (l.s.t.f32, l.s.t.i32);
+    let half = l.s.m.f32(0.5f32.to_bits());
+    let rl = l.s.op(block, "unary.f32", Attr::ReadNone, f32t, 27, &[lod]);
+    let fr = l.s.m.bin(block, Bin::Sub, lod, rl);
+    let up = l.s.m.cmp(block, pred::OGE, fr, half);
+    let fl = l.s.m.cast(block, Cast::FpToSi, rl, i32t);
+    let k0 = l.s.m.i32(0);
+    let k1 = l.s.m.i32(1);
+    let inc = l.s.m.select(block, up, k1, k0);
+    let mi = l.s.m.bin(block, Bin::Add, fl, inc);
+    // Query mip count and clamp to [0, levels-1].
+    let dims = l.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+    let all = l.s.op(block, "getDimensions", Attr::ReadOnly, dims, 72, &[h, k0]);
+    let levels = l.s.m.extract(block, all, 3);
+    let max = l.s.m.bin(block, Bin::Sub, levels, k1);
+    let mi_f = l.s.m.cast(block, Cast::SiToFp, mi, f32t);
+    let k0_f = l.s.m.cast(block, Cast::SiToFp, k0, f32t);
+    let fmax = l.s.op(block, "binary.f32", Attr::ReadNone, f32t, 35, &[mi_f, k0_f]);
+    let mz = l.s.m.cast(block, Cast::FpToSi, fmax, i32t);
+    let mz_f = l.s.m.cast(block, Cast::SiToFp, mz, f32t);
+    let max_f = l.s.m.cast(block, Cast::SiToFp, max, f32t);
+    let fmin = l.s.op(block, "binary.f32", Attr::ReadNone, f32t, 36, &[mz_f, max_f]);
+    let mip = l.s.m.cast(block, Cast::FpToSi, fmin, i32t);
+    let d = l.s.op(block, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+    (d, mip)
+}
+
+/// Rounds an explicit LOD to the nearest mip with ties up, then clamps to
+/// the image's mip range (Leonida, tools/rdna2spirv.py:13398-13411).
+fn round_lod_to_mip_sample(lod: f32, min: u32, max: u32) -> u32 {
+    let floor = lod.floor();
+    let frac = lod - floor;
+    let mip = floor as i32 + i32::from(frac >= 0.5);
+    if mip < 0 {
+        min
+    } else {
+        (mip as u32).clamp(min, max)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{
+        Lowered, Numeric, Parts, buffer_format, half_shift, lower, round_lod_to_mip_sample,
+    };
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
@@ -9289,6 +9393,17 @@ mod tests {
         assert_eq!(refusal(&words), refusal(&direct));
         words[8] = 0xBF07_8000; // read the group id instead; the timestamp is dead
         lowers(&words, group_ids_xy).expect("dead timestamp");
+    }
+
+    #[test]
+    fn image_gather4_l_rounds_lod_and_builds_struct() {
+        // The gather4_l emulation rounds the LOD and inserts four dynamic
+        // texel values into a ResRet struct; see round_lod_to_mip.
+        assert_eq!(round_lod_to_mip_sample(0.4, 0, 7), 0);
+        assert_eq!(round_lod_to_mip_sample(0.5, 0, 7), 1);
+        assert_eq!(round_lod_to_mip_sample(3.6, 0, 7), 4);
+        assert_eq!(round_lod_to_mip_sample(100.0, 0, 7), 7);
+        assert_eq!(round_lod_to_mip_sample(-5.0, 0, 7), 0);
     }
 
     #[test]
