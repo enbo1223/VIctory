@@ -213,6 +213,70 @@ fn run_cases(
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+fn run_signed_scc_cases(
+    name: &str,
+    body: &[u32],
+    operands: &[(i32, i32)],
+    reference: impl Fn(i32, i32) -> (i32, bool),
+) {
+    let mut words = body.to_vec();
+    words.extend([
+        0xBF85_0001,             // s_cbranch_scc1 over the next instruction
+        s_mov_b32(2, 0x80),      // s2 = 0 when SCC is clear
+        sop2(0x12, 7, 6, 2),     // s_xor_b32 s7, s6, s2
+        vop1(0x001, 0, sgpr(7)), // v_mov_b32 v0, s7
+    ]);
+    let shader = build_valu_cs(&words);
+    // First read the arithmetic result unchanged, then toggle its high bit
+    // only when SCC is set. This checks both outputs with the single-dword UAV.
+    let inputs: Vec<_> = operands
+        .iter()
+        .flat_map(|&(a, b)| [[a as u32, b as u32, 0, 0], [a as u32, b as u32, 1 << 31, 0]])
+        .collect();
+    run_cases(&shader, &inputs, |backend, _, [a, b, mask, _], got| {
+        let (result, overflow) = reference(a as i32, b as i32);
+        let expected = result as u32 ^ if overflow { mask } else { 0 };
+        assert_eq!(
+            got, expected,
+            "{backend}: {name}({:#010x}, {:#010x}), SCC mask {mask:#010x}",
+            a, b,
+        );
+    });
+}
+
+#[test]
+fn scalar_add_i32_scc_controls_branch() {
+    run_signed_scc_cases(
+        "s_add_i32",
+        &[sop2(0x02, 6, 0, 1)],
+        &[(i32::MAX, 1), (i32::MIN, -1), (-1, 1), (8, 5)],
+        i32::overflowing_add,
+    );
+}
+
+#[test]
+fn scalar_sub_i32_scc_controls_branch() {
+    run_signed_scc_cases(
+        "s_sub_i32",
+        &[sop2(0x03, 6, 0, 1)],
+        &[(i32::MIN, 1), (i32::MAX, -1), (0, 1), (-8, -3)],
+        i32::overflowing_sub,
+    );
+}
+
+#[test]
+fn scalar_addk_i32_scc_controls_branch() {
+    for imm in [-1i16, 1] {
+        let addk_s6 = 0xB000_0000 | 0x0F << 23 | 6 << 16 | u32::from(imm as u16);
+        run_signed_scc_cases(
+            "s_addk_i32",
+            &[s_mov_b32(6, 0), addk_s6],
+            &[(i32::MIN, 0), (i32::MAX, 0), (-1, 0), (8, 0)],
+            |a, _| a.overflowing_add(i32::from(imm)),
+        );
+    }
+}
+
 fn is_f16_nan(bits: u16) -> bool {
     (bits & 0x7FFF) > 0x7C00
 }
