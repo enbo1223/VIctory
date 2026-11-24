@@ -8,7 +8,7 @@ the platform underneath it and converts the title's data, ahead of time where
 it can and on first use where it must (shaders). See
 [docs/architecture.md](docs/architecture.md).
 
-## Status (2026-11-23)
+## Status (2026-11-24)
 
 **Not playable yet.** The title boots, runs its menus at its own 30 fps and
 loads the world, where rendering fails.
@@ -19,7 +19,7 @@ loads the world, where rendering fails.
 | Intro video with sound | works |
 | Start screen, profile and saves | works |
 | Loading into the world (about 50 s) | works |
-| The world (first mission's intro) | reached and runs with indirect draws; its title card renders, the scene after it is still dark; 0.5-1.8 s per frame |
+| The world (first mission's intro) | reached and runs with indirect draws; its title card and real world frames render, still slow and with colored trails/artifacts; 0.3-1.0 fps |
 
 Tested on one machine: Windows 11, AMD RX 6700 XT.
 
@@ -36,11 +36,11 @@ What each part does today and what it still needs:
 | Runtime services | One signed-in offline user, licences, packages, saves that survive a kill at any step, text entry dialog | Speech is silent; the dialog and relaunch are untested live |
 | Network | Offline by design: the title cannot reach the network | – |
 | Files and streaming | Archives and streamed data read, zlib and BCPack decoded in parallel | Loading is limited by writes into title memory |
-| Input | XInput pads, keyboard, keyboard stand-in pad | Trigger rumble |
+| Input | XInput pads, keyboard, keyboard stand-in pad; DualSense over HID (054C:0CE6) with face buttons, sticks, D-pad, L2/R2 analog axes, options/menu and touchpad click; rumble and L2/R2 resistance without a driver or admin rights | Confirm the physical trigger feel on a DualSense |
 | Audio | Menu, video and loading sound; XMA voices and Opus streams decode | Reverb is silent; Opus results unverified against the title |
 | GPU: menus | Draws, compute and presentation on host D3D12; only changed title memory is copied | Frame pacing drifts on one screen in release builds |
 | GPU: world | Mesh pipelines, shader-written buffers, descriptor lifetimes, indirect execution (arguments clamped), pipelines made by worker threads and kept on disk | Most of the scene is still missing (untranslated shaders drop draws); frames take seconds; real queries, depth bounds, HDR and scaling are missing |
-| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; some compute programs need a GPU with 64-lane waves |
+| Shaders | Console GPU code recompiled to DXIL at first use, cached on disk. Wave64 is emulated on 32-lane hosts; raw barycentrics, gather4_l, sample_d_cl, scalar root-view loads, LDS fences and descriptor/lane-mask fixes are translated. Menus: all. World: mesh 8,191 of 8,506, vertex/pixel 10,617 of 12,346, compute 1,643 of 2,539 | Merged geometry stages, the ray-tracing builder's shaders; remaining refusals still drop draws and leave visual artifacts |
 | Textures | Console tiled layouts and detiling for the modes the title uses | Render-target metadata planes |
 | Series S mode | Runs through the menus to the loading screen | The world, as above |
 
@@ -125,6 +125,7 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_D3D12_GBV=1` | with the above, GPU-based validation (bad descriptor use reported, not faulted; slow) |
 | `VICTORY_D3D12_DRED=1` | on a GPU failure, the allocation hit and the commands in flight |
 | `VICTORY_SKIP_PIPELINES=<hash>,...` | omit draws and dispatches, including indirect ones, whose pipeline contains a listed 16-digit shader hash |
+| `VICTORY_SKIP_WAVE64=cs,ps,vs` | triage only: omit draws/dispatch of wave64 programs in the listed stages |
 | `VICTORY_GPU_TIMING=1` | with the above, each list of a submission run and timed on its own; slow lists logged with their slowest commands |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
@@ -183,6 +184,19 @@ still drops draws whose host pipelines are not ready or whose shaders do not
 translate; those are translation limits, not device loss. A profile selector
 before the world can be passed in unattended runs with
 `VICTORY_KEYS_AS_PAD=1`.
+
+A second wave of community shader/GPU fixes is merged here too: nested
+descriptor joins, live-first pipeline queues with 64 MB compiler stacks,
+64-bit image atomics, normalized MTBUF loads, scalar root-view loads,
+`image_gather4_l`, `image_sample_d_cl`, LDS write pairs and raw
+`SV_Barycentrics`. Together they cut the measured shader refusals in a 240 s
+world run from 531 to roughly 263, and `168` shader/GPU tests pass. The
+remaining refusals are concentrated in divergent `v_readfirstlane`, wave
+ballots, unknown structured-buffer strides, untracked lane-mask joins and
+root/SGPR addresses; each is named in the diagnostic log. `VICTORY_PRESENT_1440P=1`
+keeps the presented world image stable: forcing 1920x1080 by resizing the
+window or presenting the color target directly crashes the title about 34 s
+into the world.
 
 ## License
 
