@@ -4054,13 +4054,21 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        // A raw view, read only or not; a constant buffer otherwise. (A
+        // UAV read through a constant buffer handle removes the device.)
         // A descriptor of no listed kind (one fetched from the heap by
         // index) that vector buffer loads read, and none write, is an SRV in
         // the title's heap, not a constant buffer: reading its slot through
         // a constant buffer handle is a descriptor of the wrong type.
         let buffer_view = kind.is_none() && self.buffer_loads_only(src);
-        if buffer_view || matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
-            let h = self.handle(site, src, false, (11, 0))?;
+        let raw = match kind.map(|u| u.kind) {
+            Some(ResourceType::Srv) => Some(11),
+            Some(ResourceType::Uav) => Some(11 | 0x1000),
+            _ if buffer_view => Some(11),
+            _ => None,
+        };
+        if let Some(props) = raw {
+            let h = self.handle(site, src, false, (props, 0))?;
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
