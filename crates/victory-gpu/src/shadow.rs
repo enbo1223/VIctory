@@ -201,8 +201,10 @@ impl Shadow {
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             const PIECE: usize = 64 << 10;
+            const _: () = assert!(PIECE == PAGE);
             let mut title = vec![0u8; PIECE];
             let mut synced = Vec::new();
+            let mut runs: Vec<(usize, usize)> = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PIECE - (start + at) % PIECE).min(to - at);
@@ -214,18 +216,31 @@ impl Shadow {
                 if host != old && crate::host::read_into((start + at) as *const u8, title) {
                     // Title memory with the GPU's bytes put in; the copy
                     // takes the title's bytes in turn.
-                    let mut changed = false;
-                    for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
+                    runs.clear();
+                    for (i, ((t, h), o)) in
+                        title.iter_mut().zip(host.iter_mut()).zip(old).enumerate()
+                    {
                         if *h != *o && *t != *h {
                             *t = *h;
-                            changed = true;
+                            match runs.last_mut() {
+                                Some((_, end)) if *end == i => *end = i + 1,
+                                _ => runs.push((i, i + 1)),
+                            }
                         }
                         *h = *t;
                     }
-                    if changed {
-                        crate::watch::writing(start + at, n);
-                        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                        written += n;
+                    // Only the runs the GPU changed go back: the title's
+                    // threads may write the other bytes meanwhile, and
+                    // writing the whole piece would put back what they had
+                    // before.
+                    for &(s, e) in &runs {
+                        crate::watch::writing(start + at + s, e - s);
+                        crate::host::write_mapped(
+                            (start + at + s) as *mut u8,
+                            title[s..].as_ptr(),
+                            e - s,
+                        );
+                        written += e - s;
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -240,9 +255,24 @@ impl Shadow {
                 && self.watched.load(Ordering::Relaxed) != NOT_WATCHED
                 && let Some((now, _)) = crate::watch::writes(first * PAGE, last * PAGE, true)
             {
+                // The asking also cleared any title write made after we read
+                // a page; a page still equal to title memory now had none,
+                // the others stay stale for the next refresh to copy.
+                let current: Vec<usize> = synced
+                    .into_iter()
+                    .filter(|p| (first..last).contains(p))
+                    .filter(|&p| {
+                        // SAFETY: a whole page inside the mapping.
+                        let host = unsafe {
+                            std::slice::from_raw_parts(self.data.add(p * PAGE - start), PAGE)
+                        };
+                        crate::host::read_into((p * PAGE) as *const u8, &mut title)
+                            && title[..] == *host
+                    })
+                    .collect();
                 let base = start / PAGE;
                 let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+                for page in current {
                     copied[page - base] = now;
                 }
             }
@@ -496,4 +526,129 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod copy_back_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const PAGES: usize = 64;
+
+    /// Write-watched title memory of `PAGES` pages, freed on drop.
+    struct Title(usize);
+    impl Title {
+        fn new() -> Title {
+            // SAFETY: a fresh allocation, freed on drop.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    PAGES * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert_ne!(p, 0);
+            Title(p)
+        }
+    }
+    impl Drop for Title {
+        fn drop(&mut self) {
+            // The next test's memory may come at the same address.
+            crate::watch::forget(self.0, self.0 + PAGES * PAGE);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// A host copy of the title memory, brought up to date, with shaders of
+    /// the submission declared to write all of it and byte 0 of every page
+    /// written by "the GPU".
+    fn submitted(base: usize) -> Option<Shadow> {
+        let (buffer, data) = host()?.shared_buffer((PAGES * PAGE) as u64)?;
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let s = Shadow::new(buffer, data, gpu, base as u64, (PAGES * PAGE) as u64);
+        assert_eq!(s.update(base, PAGES * PAGE), PAGES * PAGE);
+        s.writing(base, PAGES * PAGE);
+        for p in 0..PAGES {
+            // SAFETY: inside the copy.
+            unsafe { s.data.add(p * PAGE).write(1) };
+        }
+        Some(s)
+    }
+
+    fn peek(at: usize) -> u8 {
+        // SAFETY: the tests pass addresses inside their memory.
+        unsafe { (at as *const u8).read_volatile() }
+    }
+
+    /// The title's threads keep writing words no shader writes, in every
+    /// page shaders wrote, while the copy-back runs: none goes back to an
+    /// older value.
+    #[test]
+    fn copy_back_does_not_undo_title_writes_made_while_it_runs() {
+        let title = Title::new();
+        let base = title.0;
+        let Some(s) = submitted(base) else {
+            return; // no host GPU here
+        };
+        let stop = AtomicBool::new(false);
+        let undone = std::thread::scope(|t| {
+            let writer = t.spawn(|| {
+                let mut last = [0u32; PAGES];
+                let mut undone = 0;
+                while !stop.load(Relaxed) {
+                    for (p, last) in last.iter_mut().enumerate() {
+                        let at = (base + p * PAGE + 64) as *mut u32;
+                        // SAFETY: inside the title memory.
+                        unsafe {
+                            if at.read_volatile() != *last {
+                                undone += 1;
+                            }
+                            *last += 1;
+                            at.write_volatile(*last);
+                        }
+                    }
+                }
+                undone
+            });
+            s.copy_back(base, PAGES * PAGE);
+            stop.store(true, Relaxed);
+            writer.join().unwrap()
+        });
+        assert_eq!(undone, 0, "title writes undone by the copy-back");
+        assert!(
+            (0..PAGES).all(|p| peek(base + p * PAGE) == 1),
+            "the shader's bytes"
+        );
+    }
+
+    /// The title writes a page once the copy-back has put the shader's
+    /// byte there (its read of the page is done), while later pages are
+    /// still being copied back: the next refresh brings the write in.
+    #[test]
+    fn a_title_write_during_copy_back_reaches_the_copy() {
+        let title = Title::new();
+        let base = title.0;
+        let Some(s) = submitted(base) else {
+            return; // no host GPU here
+        };
+        std::thread::scope(|t| {
+            t.spawn(|| {
+                while peek(base + PAGE) != 1 {
+                    std::hint::spin_loop();
+                }
+                // SAFETY: inside the title memory.
+                unsafe { ((base + 8) as *mut u8).write_volatile(7) };
+            });
+            s.copy_back(base, PAGES * PAGE);
+        });
+        assert_eq!(peek(base + 8), 7, "in title memory");
+        s.update(base, PAGE);
+        assert_eq!(peek(s.data as usize + 8), 7, "in the copy");
+    }
 }

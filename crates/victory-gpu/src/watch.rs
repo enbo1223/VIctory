@@ -43,6 +43,15 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     found: Vec::new(),
 });
 
+/// Forgets what the journal holds for the pages of `[start, end)`: for
+/// tests that free write-watched memory, which may be handed out again.
+#[cfg(test)]
+pub(crate) fn forget(start: usize, end: usize) {
+    let pages = start / PAGE..end.div_ceil(PAGE);
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.written.retain(|page, _| !pages.contains(page));
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
