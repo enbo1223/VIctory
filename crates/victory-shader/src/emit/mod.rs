@@ -94,6 +94,8 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+#[cfg(all(test, windows))]
+mod root_view_tests;
 mod wave;
 #[cfg(test)]
 mod wave64_tests;
