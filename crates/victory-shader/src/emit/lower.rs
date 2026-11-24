@@ -2163,21 +2163,17 @@ impl<'a> Lower<'a> {
         let id = match self.s.inputs.iter().position(|e| e.kind == kind) {
             Some(id) => id,
             None => {
-                let row = self
-                    .s
-                    .inputs
-                    .iter()
-                    .filter_map(|e| e.row)
-                    .map(|r| r + 1)
-                    .max()
-                    .unwrap_or(0);
+                // System-generated values such as SV_Barycentrics are not
+                // packed into a register: DXIL expects a -1 location.
                 self.s.inputs.push(SigElement {
                     name: name.into(),
                     index: 0,
                     kind,
                     comp,
-                    interp: 1,
-                    row: Some(row),
+                    // System values are constant except barycentrics, which
+                    // DXIL requires to be linearly interpolated.
+                    interp: if kind == 28 { 2 } else { 1 },
+                    row: None,
                     col: 0,
                     cols,
                     usage: 0,

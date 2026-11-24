@@ -289,6 +289,8 @@ pub fn emit_with(
             // Constant, as DXC declares it (the AMD compiler crashed on a
             // front face without a mode).
             (13, _) => 1,
+            // SV_Barycentrics is a linearly interpolated pixel input.
+            (28, _) => 2,
             (0 | 6 | 7, 9) => 2,
             (0, _) => 1,
             _ => 0,
