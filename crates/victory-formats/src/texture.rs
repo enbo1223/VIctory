@@ -2,10 +2,10 @@
 //! alignment, where each mip and array slice starts, the address of each
 //! element, and copies between tiled memory and linear rows.
 //!
-//! Units: an element is a texel, or a 4x4 block of a block-compressed
-//! format. Mips of one array slice (or one depth slab of a thick 3D texture)
-//! are stored together, smallest first: the mip tail (the small mips sharing
-//! one block) at offset 0, mip 0 last.
+//! Units: an element is a texel, a 2x1 packed RGB pair, or a 4x4 block of
+//! a block-compressed format. Mips of one array slice (or one depth slab of
+//! a thick 3D texture) are stored together, smallest first: the mip tail
+//! (the small mips sharing one block) at offset 0, mip 0 last.
 //!
 //! The algorithm follows AMD's address library (addrlib), as shipped in Mesa
 //! under `src/amd/addrlib`: block dimensions, mip placement and mip tails
@@ -113,10 +113,17 @@ pub struct Desc {
     pub mips: u32,
     /// 1, 2, 4, 8 or 16.
     pub element_bytes: u32,
-    /// Texels per element side: 1, or 4 for block compression.
+    /// Element width in texels: 1, 2 for packed RGB, or 4 for block compression.
     pub block: u32,
     pub samples: u32,
     pub swizzle: Swizzle,
+}
+
+impl Desc {
+    /// Element height in texels. A packed RGB pair spans a single row.
+    pub fn block_height(&self) -> u32 {
+        if self.block == 2 { 1 } else { self.block }
+    }
 }
 
 /// Elements along one side of mip `mip`, as data and copies see it: texels
@@ -271,7 +278,9 @@ impl Layout {
             && (1..=MAX_MIPS).contains(&d.mips)
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
-            && matches!(d.block, 1 | 4)
+            && matches!(d.block, 1 | 2 | 4)
+            && (d.block != 2
+                || (d.width.is_multiple_of(2) && d.samples == 1 && !d.swizzle.z_order()))
             && d.samples.is_power_of_two()
             && d.samples <= 8
             && (d.samples == 1 || (d.dimension == Dimension::Tex2d && d.mips == 1))
@@ -297,11 +306,11 @@ impl Layout {
         let mut mips = vec![];
         let mut offset = 0;
         for i in (0..d.mips).rev() {
-            let h = padded_dim(d.height, i, d.block);
+            let h = padded_dim(d.height, i, d.block_height());
             let pitch = padded_dim(d.width, i, d.block).next_multiple_of(align);
             mips.push(Mip {
                 width: dim(d.width, i, d.block),
-                height: dim(d.height, i, d.block),
+                height: dim(d.height, i, d.block_height()),
                 depth: if three_d { dim(d.depth, i, 1) } else { 1 },
                 pitch,
                 rows: h,
@@ -351,8 +360,14 @@ impl Layout {
         // slices).
         let mip_depth = |i: u32| if thick { padded_dim(d.depth, i, 1) } else { 1 };
         let depth_of = |i: u32| if three_d { dim(d.depth, i, 1) } else { 1 };
-        let (width, height) = (|i| dim(d.width, i, d.block), |i| dim(d.height, i, d.block));
-        let padded = |i| (padded_dim(d.width, i, d.block), padded_dim(d.height, i, d.block));
+        let width = |i| dim(d.width, i, d.block);
+        let height = |i| dim(d.height, i, d.block_height());
+        let padded = |i| {
+            (
+                padded_dim(d.width, i, d.block),
+                padded_dim(d.height, i, d.block_height()),
+            )
+        };
         let mut mips = Vec::with_capacity(d.mips as usize);
         let mut first_tail_mip = d.mips;
         let mut slice_size = 0u64;
@@ -739,9 +754,9 @@ impl Layout {
     }
 }
 
-/// What a DXGI format stores per element: bytes, texels per element side
-/// (4 for block compression), and whether its stencil is a second plane
-/// (the GPU keeps depth and stencil apart).
+/// What a DXGI format stores per element: bytes, width in texels (2 for
+/// packed RGB, 4 for block compression), and whether stencil is a second
+/// plane (the GPU keeps depth and stencil apart).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Format {
     pub bytes: u32,
@@ -749,8 +764,7 @@ pub struct Format {
     pub stencil: bool,
 }
 
-/// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// By DXGI format number. `None` for 96-bit, 1-bit and video formats.
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -763,6 +777,7 @@ pub fn format(dxgi: u32) -> Option<Format> {
         48..=59 | 85 | 86 | 115 => (2, 1, false),
         118..=120 => (2, 1, true),
         60..=65 => (1, 1, false),
+        68 | 69 => (4, 2, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -1114,6 +1129,73 @@ mod tests {
         assert_eq!(l.mips[2].offset, 4096);
         assert_eq!(l.mips[1].offset, 8192);
         assert_eq!(l.mips[0].offset, 8192 + 16384);
+    }
+
+    #[test]
+    fn packed_rgb_mips_copy_whole_horizontal_pairs() {
+        for format in [68, 69] {
+            for swizzle in [Swizzle::LINEAR, Swizzle::SW_4KB_S] {
+                let texture = Texture::new(&TextureDesc {
+                    dimension: Dimension::Tex2d,
+                    width: 10,
+                    height: 6,
+                    depth_or_array: 2,
+                    mips: 2,
+                    format,
+                    samples: 1,
+                    swizzle,
+                })
+                .unwrap();
+                let l = &texture.planes[0].layout;
+                let m = l.mips[1];
+                // Mip 1 is 5x3 texels. Its three rows each use three 32-bit words.
+                assert_eq!((m.width, m.height, l.desc.element_bytes), (3, 3, 4));
+                let (slice, rows) = if swizzle == Swizzle::LINEAR {
+                    (2304, [0, 256, 512])
+                } else {
+                    // 4 KiB S tail: mip 1 starts at 0x600. Y0 and Y1
+                    // feed bits 4 and 5, and X0 and X1 feed bits 2 and 3.
+                    (4096, [0x600, 0x610, 0x620])
+                };
+                assert_eq!(texture.size, (2 * slice) as u64);
+                let input: Vec<u8> = (0..44).collect();
+                let mut expected = vec![0xcc; texture.size as usize];
+                let mut back = [0xcc; 44];
+                for (y, offset) in rows.into_iter().enumerate() {
+                    let at = slice + offset;
+                    expected[at..at + 12].copy_from_slice(&input[y * 16..y * 16 + 12]);
+                }
+                let mut tiled = vec![0xcc; expected.len()];
+                l.tile(&mut tiled, 1, 1, &input, 16, 0).unwrap();
+                assert_eq!(tiled, expected);
+                l.detile(&expected, 1, 1, &mut back, 16, 0).unwrap();
+                for (actual, row) in back.chunks(16).zip(input.chunks(16)) {
+                    assert_eq!(actual[..12], row[..12]);
+                    assert!(actual[12..].iter().all(|&b| b == 0xcc));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_rgb_requires_an_even_base_width_and_single_sample_color() {
+        let packed = Desc {
+            block: 2,
+            ..desc(10, 3, 1, 4, Swizzle::SW_4KB_S)
+        };
+        for invalid in [
+            Desc { width: 5, ..packed },
+            Desc {
+                samples: 2,
+                ..packed
+            },
+            Desc {
+                swizzle: Swizzle::SW_64KB_Z_X,
+                ..packed
+            },
+        ] {
+            assert_eq!(Layout::new(&invalid), Err(Error::Invalid));
+        }
     }
 
     #[test]

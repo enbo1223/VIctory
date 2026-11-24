@@ -491,7 +491,6 @@ extern "system" fn tiling(
         s if s < c.mips => l.mips[s as usize - 1].offset / TILE,
         _ => 0,
     };
-    let block = l.desc.block;
     // SAFETY: each output is null or room for its value; `out` has room
     // for `*count` entries.
     unsafe {
@@ -507,7 +506,11 @@ extern "system" fn tiling(
             };
         }
         if let Some(s) = shape.as_mut() {
-            *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
+            *s = [
+                l.block[0] * l.desc.block,
+                l.block[1] * l.desc.block_height(),
+                l.block[2],
+            ];
         }
         if let Some(n) = count.as_mut() {
             let slices = if tail { l.slices.min(2) } else { l.slices };
@@ -651,6 +654,34 @@ mod tests {
         assert_eq!(bit, 0);
         assert_eq!(offset(c, 0, 0, 128, 0, 0, 0, std::ptr::null_mut()), 0);
         slot::<extern "system" fn(This) -> u32>(c, 1)(c);
+    }
+
+    #[test]
+    fn packed_rgb_reports_texels_and_pairs_separately() {
+        use std::ptr::null_mut;
+        let c = create(&desc(510, 129, 1, 68, 0x109));
+        // SAFETY: all fields are plain data and layout overwrites them.
+        let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+        assert_eq!(layout(c, &mut *l), S_OK);
+        let m = &l.plane[0].mips[0];
+        assert_eq!(m.texels, [510, 129]);
+        assert_eq!(m.elements, [255, 129]);
+        assert_eq!((m.pitch_texels, m.pitch_bytes), (512, 1024));
+        let mut shape = [0; 3];
+        assert_eq!(
+            tiling(
+                c,
+                null_mut(),
+                null_mut(),
+                &mut shape,
+                null_mut(),
+                0,
+                null_mut()
+            ),
+            S_OK
+        );
+        assert_eq!(shape, [256, 128, 1]);
+        release(c);
     }
 
     #[test]
