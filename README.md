@@ -115,6 +115,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_STACKS=20,60` | every thread's stack at those seconds |
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS_AS_PAD=1` | with the above, scripted keys also press buttons on the pad the title reads, even if a real pad holds slot 0 (a keyboard fallback alone is only created when no pad is connected) |
+| `VICTORY_RUMBLE_TEST=1` | with a DualSense on HID, plays a 1.5 s startup pattern (both motors, then trigger resistance, then all four together); no title or menu needed |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |
 | `VICTORY_CAPTURE=<dir>` | saves presented frames (powers of two, or `VICTORY_CAPTURE_FRAMES=<list>`) |
 | `VICTORY_DUMP_TARGETS=1` | with the two above, saves every render target of those frames |
@@ -161,6 +163,15 @@ $env:VICTORY_SKIP_PIPELINES = 'db4835a364449a45,c10e7d95d8266d2a'
 Or use `VICTORY_D3D12_WARP=1`, which cannot reset the driver but is much
 slower. `VICTORY_SHADER_LOOP_LIMIT` can also be tried for the general slowness
 of world frames.
+
+With the community fixes merged here (mirrored heap slots the title writes,
+bounded one-view root SRV tables, aligned CBV tables that no longer exhaust
+the capped dynamic range, and guarded `OMSetRenderTargets` ranges), a world
+run on an RTX 4060 with `VICTORY_D3D12_DRED=1` stayed up for 160 seconds and
+rendered frames of the world. It is still slow (0.4–0.8 fps) and still drops
+draws whose shaders do not translate; those are translation limits, not device
+loss. A profile selector before the world can be passed in unattended runs
+with `VICTORY_KEYS_AS_PAD=1`.
 
 ## License
 

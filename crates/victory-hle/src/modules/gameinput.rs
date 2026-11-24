@@ -460,6 +460,24 @@ impl State {
     ) -> Vec<Event> {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
+        let mut pads = pads;
+        // Diagnostics: a scripted key is also a press on the pad the title
+        // uses, even when a real pad holds slot 0 (a keyboard fallback is
+        // only offered when no pad is connected). `VICTORY_KEYS_AS_PAD`
+        // makes unattended runs able to leave a "press A" menu.
+        #[cfg(feature = "diagnostics")]
+        if std::env::var_os("VICTORY_KEYS_AS_PAD").is_some() {
+            let scripted = fallback(&keys);
+            if let Some(pad) = pads[0].as_mut() {
+                pad.buttons |= scripted.buttons;
+                pad.left_trigger = pad.left_trigger.max(scripted.left_trigger);
+                pad.right_trigger = pad.right_trigger.max(scripted.right_trigger);
+                pad.left_x = if pad.left_x == 0.0 { scripted.left_x } else { pad.left_x };
+                pad.left_y = if pad.left_y == 0.0 { scripted.left_y } else { pad.left_y };
+                pad.right_x = if pad.right_x == 0.0 { scripted.right_x } else { pad.right_x };
+                pad.right_y = if pad.right_y == 0.0 { scripted.right_y } else { pad.right_y };
+            }
+        }
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
@@ -1367,8 +1385,26 @@ mod host {
 
             // SAFETY: the list we created above.
             unsafe { SetupDiDestroyDeviceInfoList(set) };
-            if found.is_some() {
+            if let Some(dualsense) = found.clone() {
                 tracing::info!("DualSense connected over HID (054C:0CE6)");
+                let _ = &dualsense;
+                // Diagnostics: `VICTORY_RUMBLE_TEST=1` plays a short pattern
+                // at startup so the motors and trigger resistance can be
+                // checked without having to reach a title effect.
+                #[cfg(feature = "diagnostics")]
+                if std::env::var_os("VICTORY_RUMBLE_TEST").is_some() {
+                    std::thread::spawn(move || {
+                        for (motors, ms) in [
+                            ([3000, 3000, 0, 0], 500),
+                            ([0, 0, 6000, 6000], 500),
+                            ([6000, 1000, 2000, 8000], 500),
+                        ] {
+                            dualsense.set_rumble(motors);
+                            std::thread::sleep(Duration::from_millis(ms));
+                        }
+                        dualsense.set_rumble([0; 4]);
+                    });
+                }
             }
             found
         }
