@@ -131,6 +131,37 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
 
+### World GPU failures on a real adapter
+
+The host debug layer needs a D3D12 SDK component that is not part of the
+runtime redistributable; without it `VICTORY_D3D12_DEBUG=1` only reports
+`0x887A002D`. Device-removed data works without it:
+
+```powershell
+$env:VICTORY_D3D12_DRED = '1'
+$env:VICTORY_LOG = 'info'
+.\target\diag\victory.exe run <game.exe> --execute 2> gpu.log
+```
+
+A capture of the Xbox 1.0.2.1 world with those settings reported
+`0x887A0006` after a submission of 28 lists. DRED located the first stopped
+list at command 153 of 197 (op 5, an indirect draw) with mesh
+`db4835a364449a45` and pixel `c10e7d95d8266d2a`. Those shaders read a
+43-million-element SRV and a 182-million-element (174 MB) SRV; the copy
+statistics show 4–5 GB copied into the latter range *per frame* and frames
+over a second long, long enough for Windows to time out the GPU. This is a
+limitation of the unfinished world translation, not of the game files.
+
+To avoid that draw for diagnosis, keep only the hash of one of its shaders:
+
+```powershell
+$env:VICTORY_SKIP_PIPELINES = 'db4835a364449a45,c10e7d95d8266d2a'
+```
+
+Or use `VICTORY_D3D12_WARP=1`, which cannot reset the driver but is much
+slower. `VICTORY_SHADER_LOOP_LIMIT` can also be tried for the general slowness
+of world frames.
+
 ## License
 
 GPL-3.0-or-later. See [LICENSE](LICENSE).
