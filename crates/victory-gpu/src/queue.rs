@@ -295,7 +295,6 @@ extern "system" fn present(
         #[cfg(all(windows, feature = "diagnostics"))]
         let (source, source_state) = match &fallback {
             Some(copy) => {
-                use windows::core::Interface;
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
                     // SAFETY: a live host texture.

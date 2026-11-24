@@ -245,7 +245,6 @@ pub(crate) fn note_target(resource: crate::object::This) {
     if present_1440p_on()
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        use windows::core::Interface;
         // SAFETY: a live host texture.
         let d = unsafe { copy.texture.GetDesc() };
         if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
