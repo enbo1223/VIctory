@@ -3395,7 +3395,12 @@ impl<'a> Lower<'a> {
         }
         if let Some(rest) = name.strip_prefix("ds_write") {
             let elements = if rest.starts_with('2') {
-                pair(name)
+                let mut elements = pair(name);
+                // Equal offsets perform one write with DATA0 (RDNA 2 ISA §10.4.3).
+                if offset0 == offset1 {
+                    elements.truncate(1);
+                }
+                elements
             } else if matches!(rest, "_b32" | "_b64" | "_b96" | "_b128") {
                 vec![(offset, width(name))]
             } else {

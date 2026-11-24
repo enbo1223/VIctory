@@ -1,4 +1,4 @@
-//! End-to-end tests of synthetic GFX10 VALU shaders lowered to DXIL, validated
+﻿//! End-to-end tests of synthetic GFX10 VALU shaders lowered to DXIL, validated
 //! by `dxil.dll` when present, and executed on the host GPU and WARP.
 //!
 //! Covers RDNA2 hardware semantics that differ from naive DXIL lowering:
@@ -69,6 +69,17 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    build_test_cs(
+        body,
+        ComputeIo {
+            rsrc2: 5 << 1,
+            threads: [1, 1, 1],
+        },
+        &buffer_store_dword(0, 8, 0),
+    )
+}
+
+fn build_test_cs(body: &[u32], compute: ComputeIo, result_store: &[u32]) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -79,7 +90,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
         words.push(vop1(0x001, i + 1, sgpr(i))); // v_mov_b32
     }
     words.extend_from_slice(body);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.extend_from_slice(result_store);
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -115,10 +126,7 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
             user_data: 4,
             slot: 1,
         }],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
-        }),
+        io: StageIo::Cs(compute),
         code,
     };
 
@@ -175,6 +183,17 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    run_output_cases(shader, cases, 1, |backend, i, inputs, out| {
+        check(backend, i, inputs, out[0]);
+    });
+}
+
+fn run_output_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    output_dwords: u32,
+    mut check: impl FnMut(&str, usize, [u32; 4], &[u32]),
+) {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -200,13 +219,13 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(output_dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-            check(label, i, inputs, out[0][0]);
+            check(label, i, inputs, &out[0]);
         }
         ran += 1;
     }
@@ -1020,4 +1039,88 @@ fn scalar_buffer_loads_read_a_uav_through_its_table() {
     run_cases(&shader, &cases, |backend, _, inp, got| {
         assert_eq!(got, inp[0], "{backend}: read back {got:#010x}");
     });
+}
+fn check_lds_paired_write(name: &str, write_op: u32, width: usize, stride64: bool) {
+    const LANES: u32 = 64;
+    const DWORDS_PER_LANE: usize = 4;
+    const WAIT_LDS: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
+    let inputs = [0x1234_5678, 0x9ABC_DEF0, 0x0BAD_F00D, 0xFEED_BEEF];
+    let read_op = if width == 1 { 0x36 } else { 0x76 };
+    let scale = 4 * width as u32 * if stride64 { 64 } else { 1 };
+    let data1 = 1 + width as u32;
+    for same_offset in [false, true] {
+        // Each lane starts at its own aligned 16-byte offset. Use a
+        // separation of at least 1024 bytes for the st64 accesses.
+        let distinct_offset = if stride64 { 6 } else { 3 };
+        let offsets = [2, if same_offset { 2 } else { distinct_offset }];
+        let mut body = Vec::from(vop3(0x11A, 0, 132, vgpr(0), 0)); // v0 = thread id << 4
+        body.extend([
+            0x36 << 26 | write_op << 18 | offsets[0] | offsets[1] << 8,
+            1 << 8 | data1 << 16, // Address = v0, DATA0 = v1, DATA1 = v2 or v3.
+            WAIT_LDS,
+        ]);
+        for (element, &offset) in offsets.iter().enumerate() {
+            body.extend([
+                0x36 << 26 | read_op << 18 | (offset * scale),
+                5 << 24,
+                WAIT_LDS,
+            ]);
+            let [mut store, operands] = buffer_store_dword(5, 8, 8 * element as u16);
+            store |= 1 << 12; // offen: v0 is the per-lane byte offset.
+            if width == 2 {
+                store |= 1 << 18; // buffer_store_dwordx2
+            }
+            body.extend([store, operands]);
+        }
+        let shader = build_test_cs(
+            &body,
+            ComputeIo {
+                rsrc2: (5 << 1) | (8 << 15), // 5 user SGPRs, 4096 bytes of LDS.
+                threads: [LANES, 1, 1],
+            },
+            &[],
+        );
+        run_output_cases(
+            &shader,
+            &[inputs],
+            LANES * DWORDS_PER_LANE as u32,
+            |backend, _, _, out| {
+                let second = if same_offset { 0 } else { width };
+                assert_eq!(out.len(), LANES as usize * DWORDS_PER_LANE);
+                let (lanes, _) = out.as_chunks::<DWORDS_PER_LANE>();
+                for (lane, values) in lanes.iter().enumerate() {
+                    assert_eq!(
+                        &values[..width],
+                        &inputs[..width],
+                        "{backend}: {name}, offsets {offsets:?}, lane {lane}, DATA0"
+                    );
+                    assert_eq!(
+                        &values[2..2 + width],
+                        &inputs[second..second + width],
+                        "{backend}: {name}, offsets {offsets:?}, lane {lane}, second value"
+                    );
+                }
+            },
+        );
+    }
+}
+
+#[test]
+fn paired_lds_write2_b32() {
+    check_lds_paired_write("ds_write2_b32", 0x0E, 1, false);
+}
+
+#[test]
+fn paired_lds_write2st64_b32() {
+    check_lds_paired_write("ds_write2st64_b32", 0x0F, 1, true);
+}
+
+#[test]
+fn paired_lds_write2_b64() {
+    check_lds_paired_write("ds_write2_b64", 0x4E, 2, false);
+}
+
+#[test]
+fn paired_lds_write2st64_b64() {
+    check_lds_paired_write("ds_write2st64_b64", 0x4F, 2, true);
 }
