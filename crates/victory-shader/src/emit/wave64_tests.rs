@@ -614,6 +614,47 @@ fn lds_in_opposite_divergent_arms_cannot_share_a_fence() {
 }
 
 #[test]
+fn divergent_multiple_lds_reads_without_writes_succeed() {
+    // Uniform write -> divergent branch containing two ds_read_b32s -> join.
+    // Multiple pure reads in a divergent region cannot race with each other.
+    let mut code = vec![
+        v_mov_b32(3, inline_u(0)),
+        v_lshlrev_b32(2, inline_u(2), 0),
+        v_add_nc_u32(4, inline_u(7), 0),
+    ];
+    code.extend(ds_op(0x0D, 0, 0, 2, 4, 0)); // ds_write_b32
+    code.push(v_cmp_gt_u32(inline_u(32), 0));
+    code.push(s_and_saveexec_b64(6, VCC));
+    let br = code.len();
+    code.push(0);
+    code.extend(ds_op(0x36, 0, 0, 2, 0, 3));
+    code.extend(ds_op(0x36, 4, 0, 2, 0, 5));
+    code.push(v_add_nc_u32(3, vgpr(5), 3));
+    code[br] = s_cbranch_execz((code.len() - (br + 1)) as i16);
+    code.push(s_or_b64(EXEC_LO, EXEC_LO, 6));
+    emit_uav_store(&mut code, 3, 0);
+    code.push(S_ENDPGM);
+
+    let prog = make_cs_program(&code, [64, 1, 1], 512, false);
+    for mode in [Wave64Mode::Native, Wave64Mode::Wave32, Wave64Mode::Emulate] {
+        assert!(emit_cs(&prog, mode).is_ok(), "{mode:?} should succeed");
+    }
+
+    // <= 32 threads in Wave32 fits inside one native 32-lane wave, so even a
+    // divergent write + read succeeds on Wave32 while Emulate rejects it.
+    let mut small = lds_region_program(true, false, false);
+    small.io = StageIo::Cs(ComputeIo {
+        rsrc2: match small.io {
+            StageIo::Cs(c) => c.rsrc2,
+            _ => unreachable!(),
+        },
+        threads: [32, 1, 1],
+    });
+    assert!(emit_cs(&small, Wave64Mode::Wave32).is_ok());
+    assert!(emit_cs(&small, Wave64Mode::Emulate).is_err());
+}
+
+#[test]
 fn translate_with_handles_synthetic_wave64_container() {
     // Build genuine DXBC + XDAT(XBCH(FSSM)) Wave64 compute container with ResourceHeap param.
     let mut code = Vec::new();

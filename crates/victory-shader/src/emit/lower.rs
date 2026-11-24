@@ -671,18 +671,29 @@ pub(super) struct LdsFences {
 pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences, ShaderError> {
     let order = crate::ir::reverse_postorder(&p.blocks);
     let memory = |i: &Inst| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32";
+    let is_write = |i: &Inst| !i.name().starts_with("ds_read");
     let has_memory: Vec<bool> = p
         .blocks
         .iter()
         .map(|b| b.insts.iter().any(memory))
         .collect();
+    let has_read: Vec<bool> = p
+        .blocks
+        .iter()
+        .map(|b| b.insts.iter().any(|i| memory(i) && !is_write(i)))
+        .collect();
+    let has_write: Vec<bool> = p
+        .blocks
+        .iter()
+        .map(|b| b.insts.iter().any(|i| memory(i) && is_write(i)))
+        .collect();
     let fail = |inst: &Inst| ShaderError::Unsupported {
         offset: inst.machine.offset,
         what: "LDS accesses without a uniform LDS fence in split wave64",
     };
-    // The two host halves can take different arms at the same time. Count
-    // accesses across all arms before the next uniform checkpoint, not only
-    // along individual CFG paths (a write in `then`, a read in `else`).
+    // The two host halves can take different arms at the same time. Multiple pure
+    // reads cannot race with each other, whereas any write/atomic conflicts with
+    // another read or write anywhere in the same unfenced divergent region.
     for &root in &order {
         if !uniform[root] && root != order[0] {
             continue;
@@ -693,32 +704,49 @@ pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences
             vec![root]
         };
         let mut seen = vec![false; p.blocks.len()];
-        let mut access = false;
+        let mut saw_read = false;
+        let mut saw_write = false;
         while let Some(b) = stack.pop() {
             if uniform[b] || seen[b] {
                 continue;
             }
             seen[b] = true;
             for inst in p.blocks[b].insts.iter().filter(|i| memory(i)) {
-                if access {
-                    return Err(fail(inst));
+                if is_write(inst) {
+                    if saw_write || saw_read {
+                        return Err(fail(inst));
+                    }
+                    saw_write = true;
+                } else {
+                    if saw_write {
+                        return Err(fail(inst));
+                    }
+                    saw_read = true;
                 }
-                access = true;
             }
             stack.extend(p.blocks[b].exit.successors());
         }
     }
     // An access not yet ordered by a checkpoint on some incoming path. A
     // uniform block orders incoming accesses at entry and its own at exit.
-    let mut pending = vec![false; p.blocks.len()];
+    let mut pending_read = vec![false; p.blocks.len()];
+    let mut pending_write = vec![false; p.blocks.len()];
     loop {
         let mut changed = false;
         for &b in &order {
-            let next =
-                !uniform[b] && (has_memory[b] || p.blocks[b].preds.iter().any(|&q| pending[q]));
-            if next && !pending[b] {
-                pending[b] = true;
-                changed = true;
+            if !uniform[b] {
+                let next_r =
+                    has_read[b] || p.blocks[b].preds.iter().any(|&q| pending_read[q]);
+                let next_w =
+                    has_write[b] || p.blocks[b].preds.iter().any(|&q| pending_write[q]);
+                if next_r && !pending_read[b] {
+                    pending_read[b] = true;
+                    changed = true;
+                }
+                if next_w && !pending_write[b] {
+                    pending_write[b] = true;
+                    changed = true;
+                }
             }
         }
         if !changed {
@@ -727,21 +755,30 @@ pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences
     }
     let mut fences = LdsFences::default();
     for &b in &order {
-        let incoming = p.blocks[b].preds.iter().any(|&q| pending[q]);
+        let in_read = p.blocks[b].preds.iter().any(|&q| pending_read[q]);
+        let in_write = p.blocks[b].preds.iter().any(|&q| pending_write[q]);
         if uniform[b] {
-            if incoming {
+            if in_read || in_write {
                 fences.enter.insert(b);
             }
             if has_memory[b] {
                 fences.leave.insert(b);
             }
         } else {
-            let mut previous = incoming;
+            let mut prev_read = in_read;
+            let mut prev_write = in_write;
             for inst in p.blocks[b].insts.iter().filter(|i| memory(i)) {
-                if previous {
-                    return Err(fail(inst));
+                if is_write(inst) {
+                    if prev_write || prev_read {
+                        return Err(fail(inst));
+                    }
+                    prev_write = true;
+                } else {
+                    if prev_write {
+                        return Err(fail(inst));
+                    }
+                    prev_read = true;
                 }
-                previous = true;
             }
         }
     }
@@ -952,7 +989,7 @@ impl<'a> Lower<'a> {
                                 lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
                                 cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
                             }
-                            if total_threads <= 64 && has_lds_mem {
+                            if total_threads > 32 && total_threads <= 64 && has_lds_mem {
                                 need_lds_barriers = true;
                             }
                         }
