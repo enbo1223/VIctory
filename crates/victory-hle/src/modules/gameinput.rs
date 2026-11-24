@@ -113,6 +113,12 @@ trait Source: Send {
     fn keys(&mut self) -> Vec<KeyState>;
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
+    /// All four vibration levels (left, right, left trigger, right trigger)
+    /// from the title's `GameInput` call. Hosts without trigger motors just
+    /// use the first two.
+    fn rumble_full(&mut self, slot: usize, motors: [u16; 4]) {
+        self.rumble(slot, motors[0], motors[1]);
+    }
 }
 
 fn fallback(keys: &[KeyState]) -> PadState {
@@ -908,24 +914,30 @@ extern "system" fn device_status(this: *const Device) -> u32 {
         0
     }
 }
-// shortcut: trigger motors are dropped (XInput has none). The host API that
-// drives them without a redistributable is Windows.Gaming.Input (WinRT
-// `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// The title sends four levels through `GameInput` slot 0x50: left motor,
+// right motor, left trigger and right trigger (the `GameInputVibration`
+// order). XInput pads only have the first two; the DualSense HID source uses
+// all four to drive its rumble motors and trigger-resistance effects.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
     if device.index >= PADS {
         return;
     }
-    let [low, high, ..] = if params.is_null() {
+    let [low, high, left_trigger, right_trigger] = if params.is_null() {
         [0.0; 4]
     } else {
         // SAFETY: checked non-null; four motor levels.
         unsafe { *params }
     };
     let speed = |level: f32| (level.clamp(0.0, 1.0) * f32::from(u16::MAX)) as u16;
-    lock(&device.hub().source).rumble(device.index, speed(low), speed(high));
+    let motors = [
+        speed(low),
+        speed(high),
+        speed(left_trigger),
+        speed(right_trigger),
+    ];
+    lock(&device.hub().source).rumble_full(device.index, motors);
 }
 extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
     tracing::warn!(
@@ -1127,21 +1139,430 @@ mod host {
         }
     }
 
-    #[derive(Default)]
+    /// DualSense over Bluetooth is a HID device, not an XInput one. Windows
+    /// exposes it to us with no driver; read its simple input report (0x01)
+    /// straight from the HID collection and present it as host pad slot 0.
+    mod dualsense {
+        use super::*;
+        use std::sync::{Arc, Mutex};
+
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
+            SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
+            SP_DEVICE_INTERFACE_DATA,
+        };
+        use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+            HidD_GetAttributes, GUID_DEVINTERFACE_HID, HIDD_ATTRIBUTES,
+        };
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, ReadFile, WriteFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+
+        const VID: u16 = 0x054c;
+        const PID: u16 = 0x0ce6;
+
+        /// Shared with the reader thread. Holds the last input report and the
+        /// raw HID handle used to write rumble/effect reports back.
+        pub(super) struct Inner {
+            /// `None` until a first report arrives (and again when disconnected).
+            pub(super) state: Mutex<Option<PadState>>,
+            handle: usize,
+            last: Mutex<[u16; 4]>,
+        }
+        pub(super) type State = Arc<Inner>;
+
+        impl Inner {
+            /// Send a Bluetooth output report 0x31 with the two rumble motors
+            /// and both trigger-resistance effects. The payload is the
+            /// 47-byte `DS5EffectsState_t` documented by the Game Controller
+            /// Wiki; Bluetooth adds a 3-byte header and a 4-byte CRC.
+            pub(super) fn set_rumble(&self, motors: [u16; 4]) {
+                let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+                if *last == motors {
+                    return;
+                }
+                *last = motors;
+                let report = effects_report(motors);
+                let mut written = 0u32;
+                // SAFETY: owned HID handle and a full 78-byte output report.
+                unsafe {
+                    WriteFile(
+                        self.handle as *mut c_void,
+                        report.as_ptr() as *const _,
+                        report.len() as u32,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    );
+                }
+            }
+        }
+
+        /// SDL's streaming CRC-32, the variant used in DualSense Bluetooth
+        /// output reports (not the final-xor zlib CRC-32).
+        fn crc32(mut crc: u32, data: &[u8]) -> u32 {
+            for &byte in data {
+                let mut r = u32::from((crc as u8) ^ byte);
+                for _ in 0..8 {
+                    r = if r & 1 != 0 { (r >> 1) ^ 0xEDB88320 } else { r >> 1 };
+                }
+                crc = (r ^ 0xFF000000) ^ (crc >> 8);
+            }
+            crc
+        }
+
+        /// Build the 78-byte Bluetooth effects report. `motors` are 16-bit
+        /// levels; the HID fields are 8-bit, so we keep the high byte.
+        fn effects_report([left, right, lt, rt]: [u16; 4]) -> [u8; 78] {
+            let level = |v: u16| (v >> 8) as u8;
+            let mut report = [0u8; 78];
+            report[0] = 0x31; // Bluetooth output report id
+            report[1] = 0x00; // tag and sequence
+            report[2] = 0x10; // magic value
+            // DS5EffectsState_t starts at offset 3. Keep every effect enabled
+            // so zero levels also *stop* a previous effect.
+            report[3] = 0x0f; // rumble emulation, no haptics, both triggers FFB
+            report[4] = 0x00; // EnableBits2
+            report[5] = level(right); // ucRumbleRight
+            report[6] = level(left); // ucRumbleLeft
+            // Right trigger effect at payload offset 10, left at 21.
+            // Simple_Feedback (0x01) with position 0, strength = level.
+            // Off (0x05) releases the spring when the level is zero.
+            report[13] = if rt == 0 { 0x05 } else { 0x01 };
+            report[15] = level(rt);
+            report[24] = if lt == 0 { 0x05 } else { 0x01 };
+            report[26] = level(lt);
+            // CRC over the 0xA2 HIDP header followed by bytes 0..73.
+            let crc = crc32(crc32(0, &[0xA2]), &report[..74]);
+            report[74..].copy_from_slice(&crc.to_le_bytes());
+            report
+        }
+
+        pub(super) fn connect() -> Option<State> {
+            // SAFETY: class device list, queried read-only and destroyed below.
+            let set = unsafe {
+                SetupDiGetClassDevsW(
+                    &GUID_DEVINTERFACE_HID,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
+                )
+            };
+            if set == -1 {
+                return None;
+            }
+
+            let mut found: Option<State> = None;
+            for index in 0..128u32 {
+                // SAFETY: out parameter, zeroed before the call.
+                let mut interface: SP_DEVICE_INTERFACE_DATA = unsafe { std::mem::zeroed() };
+                interface.cbSize = size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+                // SAFETY: valid list and out parameter.
+                if unsafe {
+                    SetupDiEnumDeviceInterfaces(
+                        set,
+                        std::ptr::null(),
+                        &GUID_DEVINTERFACE_HID,
+                        index,
+                        &mut interface,
+                    )
+                } == 0
+                {
+                    break;
+                }
+
+                // cbSize is 8 on 64-bit (DWORD + one WCHAR, padded).
+                let mut detail = [0u8; 1024];
+                detail[..4].copy_from_slice(&8u32.to_ne_bytes());
+                let mut required = 0u32;
+                // SAFETY: a 1024-byte buffer, reported as such.
+                let ok = unsafe {
+                    SetupDiGetDeviceInterfaceDetailW(
+                        set,
+                        &interface,
+                        detail.as_mut_ptr() as *mut _,
+                        detail.len() as u32,
+                        &mut required,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || required as usize > detail.len() {
+                    continue;
+                }
+                let words = unsafe {
+                    std::slice::from_raw_parts(detail.as_ptr().add(4) as *const u16, 500)
+                };
+                let len = words.iter().position(|&w| w == 0).unwrap_or(words.len());
+                let path: Vec<u16> = words[..len]
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(0))
+                    .collect();
+
+                // SAFETY: null-terminated path, no overlapped I/O.
+                let handle = unsafe {
+                    CreateFileW(
+                        path.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        std::ptr::null(),
+                        OPEN_EXISTING,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if handle == INVALID_HANDLE_VALUE {
+                    continue;
+                }
+                // SAFETY: an open HID handle, out parameter initialized below.
+                let mut attributes: HIDD_ATTRIBUTES = unsafe { std::mem::zeroed() };
+                attributes.Size = size_of::<HIDD_ATTRIBUTES>() as u32;
+                let is_dualsense = unsafe { HidD_GetAttributes(handle, &mut attributes) }
+                    && attributes.VendorID == VID
+                    && attributes.ProductID == PID;
+                if !is_dualsense {
+                    // SAFETY: handle from CreateFileW above.
+                    unsafe { CloseHandle(handle) };
+                    continue;
+                }
+
+                let shared: State = Arc::new(Inner {
+                    state: Mutex::new(None),
+                    handle: handle as usize,
+                    last: Mutex::new([0; 4]),
+                });
+                let reader = Arc::clone(&shared);
+                // Raw handles are not `Send`; move the integer bits instead.
+                let handle_bits = handle as usize;
+                std::thread::spawn(move || {
+                    let handle = handle_bits as *mut std::ffi::c_void;
+                    let mut report = [0u8; 78];
+                    loop {
+                        let mut read = 0u32;
+                        // SAFETY: valid handle and buffer; synchronous read.
+                        let ok = unsafe {
+                            ReadFile(
+                                handle,
+                                report.as_mut_ptr() as *mut _,
+                                report.len() as u32,
+                                &mut read,
+                                std::ptr::null_mut(),
+                            )
+                        };
+                        if ok == 0 || read as usize != report.len() {
+                            break;
+                        }
+                        *reader.state.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(convert_report(&report));
+                    }
+                    *reader.state.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    // SAFETY: this thread now owns the handle.
+                    unsafe { CloseHandle(handle) };
+                });
+                found = Some(shared);
+                break;
+            }
+
+            // SAFETY: the list we created above.
+            unsafe { SetupDiDestroyDeviceInfoList(set) };
+            if found.is_some() {
+                tracing::info!("DualSense connected over HID (054C:0CE6)");
+            }
+            found
+        }
+
+        /// DualSense Bluetooth simple report (0x01). Offsets include the HID
+        /// report ID at byte 0; layout follows the Game Controller Wiki:
+        /// https://controllers.fandom.com/wiki/Sony_DualSense/Data_Structures
+        /// Sticks 1..4, D-pad/face buttons 5, shoulders/system buttons 6,
+        /// Home/touchpad/counter 7, triggers 8 and 9.
+        fn convert_report(report: &[u8; 78]) -> PadState {
+            let b1 = report[5];
+            let b2 = report[6];
+            let b3 = report[7];
+            let mut buttons = 0u32;
+            // Face buttons are the high nibble: Square, Cross, Circle,
+            // Triangle. The low nibble is the D-pad (8 means neutral).
+            if b1 & 0x10 != 0 {
+                buttons |= X;
+            }
+            if b1 & 0x20 != 0 {
+                buttons |= A;
+            }
+            if b1 & 0x40 != 0 {
+                buttons |= B;
+            }
+            if b1 & 0x80 != 0 {
+                buttons |= Y;
+            }
+            buttons |= match b1 & 0x0f {
+                0 => UP,
+                1 => UP | RIGHT,
+                2 => RIGHT,
+                3 => DOWN | RIGHT,
+                4 => DOWN,
+                5 => DOWN | LEFT,
+                6 => LEFT,
+                7 => UP | LEFT,
+                _ => 0,
+            };
+            // L1, R1, Create, Options, L3, R3.
+            if b2 & 0x01 != 0 {
+                buttons |= LEFT_SHOULDER;
+            }
+            if b2 & 0x02 != 0 {
+                buttons |= RIGHT_SHOULDER;
+            }
+            if b2 & 0x10 != 0 {
+                buttons |= VIEW;
+            }
+            if b2 & 0x20 != 0 {
+                buttons |= MENU;
+            }
+            if b2 & 0x40 != 0 {
+                buttons |= LEFT_STICK;
+            }
+            if b2 & 0x80 != 0 {
+                buttons |= RIGHT_STICK;
+            }
+            // Byte 7 also packs PS/Home (bit 1), touchpad click (bit 2) and
+            // a 6-bit rolling counter in its upper bits.
+            if b3 & 0x02 != 0 {
+                buttons |= MENU;
+            }
+            if b3 & 0x04 != 0 {
+                buttons |= VIEW;
+            }
+
+            let axis = |raw: u8, invert: bool| {
+                // 0..255 maps to -1..1, so the extremes are exact.
+                let delta = f32::from(raw) - 127.5;
+                // The controller's rest position drifts by a few units.
+                if delta.abs() < 8.0 {
+                    return 0.0;
+                }
+                let n = (delta / 127.5).clamp(-1.0, 1.0);
+                if invert { -n } else { n }
+            };
+            PadState {
+                buttons,
+                left_trigger: f32::from(report[8]) / 255.0,
+                right_trigger: f32::from(report[9]) / 255.0,
+                left_x: axis(report[1], false),
+                // HID reports count downwards for "up"; XInput counts upwards.
+                left_y: axis(report[2], true),
+                right_x: axis(report[3], false),
+                right_y: axis(report[4], true),
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            fn report(b1: u8, b2: u8, b3: u8) -> [u8; 78] {
+                let mut r = [0u8; 78];
+                r[0] = 1;
+                r[5] = b1;
+                r[6] = b2;
+                r[7] = b3;
+                r
+            }
+
+            #[test]
+            fn simple_report_maps_every_button() {
+                // Cross + D-pad East; Options + R3; PS/Home + touchpad click.
+                let state = convert_report(&report(0x22, 0xa0, 0x06));
+                assert_eq!(
+                    state.buttons,
+                    A | RIGHT | MENU | RIGHT_STICK | VIEW
+                );
+                // Square, Circle, Triangle occupy the remaining face bits.
+                assert_eq!(convert_report(&report(0x18, 0, 0)).buttons, X);
+                assert_eq!(convert_report(&report(0x48, 0, 0)).buttons, B);
+                assert_eq!(convert_report(&report(0x88, 0, 0)).buttons, Y);
+                // Neutral D-pad is 8; L1/R1/Share/L3 are the low bits of b2.
+                assert_eq!(
+                    convert_report(&report(0x08, 0x5b, 0)).buttons,
+                    LEFT_SHOULDER | RIGHT_SHOULDER | VIEW | LEFT_STICK
+                );
+            }
+
+            #[test]
+            fn simple_report_maps_triggers_and_sticks() {
+                let mut r = report(0x08, 0x0c, 0);
+                r[1] = 255; // left stick right
+                r[2] = 0;   // left stick up
+                r[3] = 0;   // right stick left
+                r[4] = 255; // right stick down
+                r[8] = 200; // L2
+                r[9] = 100; // R2
+                let state = convert_report(&r);
+                assert_eq!((state.left_x, state.left_y), (1.0, 1.0));
+                assert_eq!((state.right_x, state.right_y), (-1.0, -1.0));
+                assert_eq!((state.left_trigger, state.right_trigger), (200.0 / 255.0, 100.0 / 255.0));
+            }
+
+            #[test]
+            fn effects_report_drives_all_four_motors() {
+                let r = effects_report([0xffff, 0x8000, 0xff00, 0x7f00]);
+                assert_eq!(&r[..3], &[0x31, 0x00, 0x10]);
+                assert_eq!(r[3], 0x0f); // rumble + both trigger effects enabled
+                assert_eq!((r[5], r[6]), (0x80, 0xff)); // right, left motor
+                assert_eq!((r[13], r[15]), (0x01, 0x7f)); // right trigger
+                assert_eq!((r[24], r[26]), (0x01, 0xff)); // left trigger
+                // Checksum covers the 0xA2 header and bytes 0..73.
+                let expected = crc32(crc32(0, &[0xA2]), &r[..74]);
+                assert_eq!(&r[74..], &expected.to_le_bytes());
+
+                let off = effects_report([0; 4]);
+                assert_eq!((off[5], off[6]), (0, 0));
+                assert_eq!((off[13], off[24]), (0x05, 0x05)); // triggers released
+            }
+
+            #[test]
+            fn crc32_matches_sdl_reference() {
+                // SDL_crc32(0, "123456789") from SDL's own test suite.
+                assert_eq!(crc32(0, b"123456789"), 0xc6dd_3518);
+            }
+        }
+    }
+
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        dualsense: Option<dualsense::State>,
+    }
+
+    impl Default for Host {
+        fn default() -> Self {
+            Self {
+                empty_until: [None; PADS],
+                dualsense: dualsense::connect(),
+            }
+        }
+    }
+
+    impl Host {
+        /// Last reading from the DualSense, when it is connected and while an
+        /// XInput controller does not own slot 0.
+        fn dualsense_pad(&self) -> Option<PadState> {
+            let shared = self.dualsense.as_ref()?;
+            *shared.state.lock().unwrap_or_else(|e| e.into_inner())
+        }
     }
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+                return if slot == 0 { self.dualsense_pad() } else { None };
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+                return if slot == 0 { self.dualsense_pad() } else { None };
             }
             self.empty_until[slot] = None;
             Some(convert(&state.Gamepad))
@@ -1181,6 +1602,17 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+
+        fn rumble_full(&mut self, slot: usize, motors: [u16; 4]) {
+            self.rumble(slot, motors[0], motors[1]);
+            // The DualSense is our stand-in for slot 0 only while XInput has
+            // no pad there. Send all four levels to its HID output report.
+            if slot == 0 && self.empty_until[0].is_some() {
+                if let Some(dualsense) = &self.dualsense {
+                    dualsense.set_rumble(motors);
+                }
+            }
         }
     }
 
