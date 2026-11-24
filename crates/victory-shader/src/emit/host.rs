@@ -73,6 +73,15 @@ impl Host {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
+                let desc = adapter
+                    .cast::<IDXGIAdapter1>()
+                    .map_err(err)?
+                    .GetDesc1()
+                    .map_err(err)?;
+                // DXGI under Wine/DXVK may return the first hardware adapter for EnumWarpAdapter.
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+                    return Err("WARP adapter is not a software adapter".to_string());
+                }
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
@@ -1454,6 +1463,14 @@ mod tests {
                 continue;
             };
             let mode = h.recommended_wave64_mode();
+            let expected = if h.supports_wave64() {
+                Wave64Mode::Native
+            } else if h.supports_wave32() {
+                Wave64Mode::Wave32
+            } else {
+                Wave64Mode::Emulate
+            };
+            assert_eq!(mode, expected);
             let required_wave = match mode {
                 Wave64Mode::Native => Some(64),
                 Wave64Mode::Wave32 => Some(32),
@@ -1461,9 +1478,6 @@ mod tests {
             };
             h.compute_pipeline(&cs_with_wave_size(required_wave))
                 .expect("recommended Wave64 mode should build a compute PSO");
-            if warp {
-                assert_eq!(mode, Wave64Mode::Emulate);
-            }
         }
     }
 }

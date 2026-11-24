@@ -491,7 +491,7 @@ fn compute_postdoms(n: usize, succs: &[Vec<usize>], fwd: &[bool]) -> (Vec<usize>
 
 /// Computes which IR blocks are thread-group uniform (all active threads arrive
 /// together) and which IR values hold group-uniform scalars.
-fn compute_uniformity(
+pub(super) fn compute_uniformity(
     p: &Program,
     st: &Structured,
     res: &Resources,
@@ -584,15 +584,29 @@ fn compute_uniformity(
                         &inst.fields,
                         Fields::Valu(v) if v.dpp.is_none() && v.sdwa.is_none()
                     );
-                let scalar_op = (matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. })
-                    || uniform_copy)
+                let scalar_op = matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. })
                     && !iname.starts_with("s_getreg")
                     && !iname.starts_with("s_bcnt")
                     && !iname.starts_with("s_ff1")
                     && !iname.contains("saveexec");
                 let reads_ok = blk_ok
-                    && scalar_op
-                    && inst.reads.iter().all(|&(_, v)| val_uniform[v.0 as usize]);
+                    && if uniform_copy {
+                        let Fields::Valu(v) = &inst.fields else {
+                            unreachable!()
+                        };
+                        v.src.first().is_some_and(|op| match *op {
+                            Operand::Const(_) | Operand::Literal(_) => true,
+                            Operand::Scalar { code, .. } if code != NULL => inst
+                                .read(Reg::S(code))
+                                .is_some_and(|sv| val_uniform[sv.0 as usize]),
+                            Operand::Vector { reg, .. } => inst
+                                .read(Reg::V(reg))
+                                .is_some_and(|vv| val_uniform[vv.0 as usize]),
+                            _ => false,
+                        })
+                    } else {
+                        scalar_op && inst.reads.iter().all(|&(_, v)| val_uniform[v.0 as usize])
+                    };
                 for &(_, w) in &inst.writes {
                     if val_uniform[w.0 as usize] && !reads_ok {
                         val_uniform[w.0 as usize] = false;
@@ -643,6 +657,95 @@ fn compute_uniformity(
         }
     }
     (blocks, val_uniform)
+}
+
+/// Group-uniform checkpoints that order the LDS accesses of a split console
+/// wave. A divergent region cannot contain two accesses without such a
+/// checkpoint: placing a group barrier inside it could deadlock.
+#[derive(Default)]
+pub(super) struct LdsFences {
+    pub(super) enter: HashSet<usize>,
+    pub(super) leave: HashSet<usize>,
+}
+
+pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences, ShaderError> {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let memory = |i: &Inst| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32";
+    let has_memory: Vec<bool> = p
+        .blocks
+        .iter()
+        .map(|b| b.insts.iter().any(memory))
+        .collect();
+    let fail = |inst: &Inst| ShaderError::Unsupported {
+        offset: inst.machine.offset,
+        what: "LDS accesses without a uniform LDS fence in split wave64",
+    };
+    // The two host halves can take different arms at the same time. Count
+    // accesses across all arms before the next uniform checkpoint, not only
+    // along individual CFG paths (a write in `then`, a read in `else`).
+    for &root in &order {
+        if !uniform[root] && root != order[0] {
+            continue;
+        }
+        let mut stack = if uniform[root] {
+            p.blocks[root].exit.successors()
+        } else {
+            vec![root]
+        };
+        let mut seen = vec![false; p.blocks.len()];
+        let mut access = false;
+        while let Some(b) = stack.pop() {
+            if uniform[b] || seen[b] {
+                continue;
+            }
+            seen[b] = true;
+            for inst in p.blocks[b].insts.iter().filter(|i| memory(i)) {
+                if access {
+                    return Err(fail(inst));
+                }
+                access = true;
+            }
+            stack.extend(p.blocks[b].exit.successors());
+        }
+    }
+    // An access not yet ordered by a checkpoint on some incoming path. A
+    // uniform block orders incoming accesses at entry and its own at exit.
+    let mut pending = vec![false; p.blocks.len()];
+    loop {
+        let mut changed = false;
+        for &b in &order {
+            let next =
+                !uniform[b] && (has_memory[b] || p.blocks[b].preds.iter().any(|&q| pending[q]));
+            if next && !pending[b] {
+                pending[b] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut fences = LdsFences::default();
+    for &b in &order {
+        let incoming = p.blocks[b].preds.iter().any(|&q| pending[q]);
+        if uniform[b] {
+            if incoming {
+                fences.enter.insert(b);
+            }
+            if has_memory[b] {
+                fences.leave.insert(b);
+            }
+        } else {
+            let mut previous = incoming;
+            for inst in p.blocks[b].insts.iter().filter(|i| memory(i)) {
+                if previous {
+                    return Err(fail(inst));
+                }
+                previous = true;
+            }
+        }
+    }
+    Ok(fences)
 }
 
 /// Masks read as data in a block other than their defining block, keyed by defining block (`None` = entry).
@@ -789,7 +892,6 @@ impl<'a> Lower<'a> {
             };
             let has_lds_mem = insts()
                 .any(|i| matches!(i.fields, Fields::Ds { .. }) && i.name() != "ds_swizzle_b32");
-            let has_s_barrier = insts().any(|i| i.name() == "s_barrier");
             let has_swizzle_or_dpp = insts().any(|i| {
                 i.name().starts_with("ds_swizzle")
                     || i.name().contains("permute")
@@ -850,7 +952,7 @@ impl<'a> Lower<'a> {
                                 lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
                                 cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
                             }
-                            if total_threads <= 64 && has_lds_mem && !has_s_barrier {
+                            if total_threads <= 64 && has_lds_mem {
                                 need_lds_barriers = true;
                             }
                         }
@@ -876,8 +978,7 @@ impl<'a> Lower<'a> {
                             lds_overflow = emu_dwords > 0 && s.lds_dwords > 8192;
                             cross_block_masks = collect_cross_block_masks(p, x.st, &def_block);
                         }
-                        if total_threads > 1 && total_threads <= 64 && has_lds_mem && !has_s_barrier
-                        {
+                        if total_threads > 1 && total_threads <= 64 && has_lds_mem {
                             need_lds_barriers = true;
                         }
                     }
@@ -1343,12 +1444,11 @@ impl<'a> Lower<'a> {
 
     /// Emulates `v_readfirstlane_b32(val)` across all 64 lanes of a virtual wave.
     fn emulated_readfirstlane(&mut self, val: V, guard: Option<V>) -> Result<V, Why> {
-        if self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false) {
+        let divergent =
+            self.guard_depth > 0 || !self.uniform.get(self.cur_ir).copied().unwrap_or(false);
+        if divergent && self.wave64 != Wave64Mode::Wave32 {
             return Err("v_readfirstlane in divergent control flow");
         }
-        let (_, console_lane, vwave) = self.ensure_wave_ids();
-        let stride = self.ballot_stride;
-        let base = self.ballot_base;
         let act = guard.unwrap_or_else(|| self.s.m.bool(true));
         if self.wave64 == Wave64Mode::Wave32 {
             let c = self.cur;
@@ -1366,6 +1466,16 @@ impl<'a> Lower<'a> {
                 .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[mask]);
             let safe_idx = self.s.m.select(c, any, bit, k0);
             let picked = self.read_lane(val, safe_idx);
+            if divergent {
+                // shortcut: in divergent control flow the halves cannot meet at a
+                // barrier, so each 32-lane half reads its own first active lane.
+                // Exact when the value is uniform across active lanes or inside a
+                // waterfall loop visiting distinct values half by half.
+                return Ok(picked);
+            }
+            let (_, console_lane, vwave) = self.ensure_wave_ids();
+            let stride = self.ballot_stride;
+            let base = self.ballot_base;
 
             self.lds_barrier(self.cur);
             let k0 = self.s.m.i32(0);
@@ -1399,15 +1509,23 @@ impl<'a> Lower<'a> {
             let c = self.cur;
             let pm0 = self.scratch_ptr(c, base, stride, vwave, 0);
             let pv0 = self.scratch_ptr(c, base, stride, vwave, 1);
+            let pm1 = self.scratch_ptr(c, base, stride, vwave, 2);
             let pv1 = self.scratch_ptr(c, base, stride, vwave, 3);
             let m0 = self.s.m.load(c, pm0);
+            let m1 = self.s.m.load(c, pm1);
             let v0 = self.s.m.load(c, pv0);
             let v1 = self.s.m.load(c, pv1);
-            let use0 = self.s.m.cmp(c, pred::NE, m0, k0);
+            // GFX10 `v_readfirstlane_b32` with `EXEC == 0` returns lane 0 (`v0`).
+            let has0 = self.s.m.cmp(c, pred::NE, m0, k0);
+            let no1 = self.s.m.cmp(c, pred::EQ, m1, k0);
+            let use0 = self.s.m.bin(c, Bin::Or, has0, no1);
             return Ok(self.s.m.select(c, use0, v0, v1));
         }
 
         // Emulate mode: find lowest active console lane via atomicMin.
+        let (_, console_lane, vwave) = self.ensure_wave_ids();
+        let stride = self.ballot_stride;
+        let base = self.ballot_base;
         self.lds_barrier(self.cur);
         let k0 = self.s.m.i32(0);
         let kmax = self.s.m.i32(u32::MAX);
@@ -1431,7 +1549,12 @@ impl<'a> Lower<'a> {
         self.lds_barrier(self.cur);
         let pw = self.scratch_ptr(self.cur, base, stride, vwave, 0);
         let winner = self.s.m.load(self.cur, pw);
-        let is_win = self.s.m.cmp(self.cur, pred::EQ, winner, console_lane);
+        let has_win = self.s.m.cmp(self.cur, pred::NE, winner, kmax);
+        let fallback_lane = self.s.m.select(self.cur, has_win, winner, k0);
+        let is_win = self
+            .s
+            .m
+            .cmp(self.cur, pred::EQ, fallback_lane, console_lane);
         let at_win = self.begin_guarded(Some(is_win));
         let pv = self.scratch_ptr(self.cur, base, stride, vwave, 1);
         self.s.m.store(self.cur, pv, val);
@@ -1812,6 +1935,11 @@ impl<'a> Lower<'a> {
         }
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
+        let lds_fences = if self.need_lds_barriers {
+            plan_lds_fences(p, &self.uniform).map_err(Stop::Fail)?
+        } else {
+            LdsFences::default()
+        };
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
         }
@@ -1871,6 +1999,9 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            if lds_fences.enter.contains(&b) {
+                self.lds_barrier(self.cur);
+            }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
@@ -1886,6 +2017,9 @@ impl<'a> Lower<'a> {
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.emulating_wave64() {
                 self.preemit_masks(Some(b));
+            }
+            if lds_fences.leave.contains(&b) {
+                self.lds_barrier(self.cur);
             }
             self.tail[b] = Some(self.cur);
             self.exit(b)?;
@@ -4725,12 +4859,17 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
+        // Avoid passing out-of-range lane indices (e.g. `0 - 1` on row_shr edge) to waveReadLaneAt.
+        let safe_src = match inside {
+            Some(pred) => self.s.m.select(c, pred, src, lane),
+            None => src,
+        };
         let mut r = if mesh_quad {
-            self.quad_pick(x, src)
+            self.quad_pick(x, safe_src)
         } else if emulate {
-            self.exchange_64(x, src)?
+            self.exchange_64(x, safe_src)?
         } else {
-            self.read_lane(x, src)
+            self.read_lane(x, safe_src)
         };
         let mut enable = None;
         if let Some(inside) = inside {
@@ -5307,7 +5446,10 @@ impl<'a> Lower<'a> {
                     }),
                     _ => false,
                 });
-                if self.emulating_wave64() && (self.console_lanes || non_uniform) {
+                if self.emulating_wave64() {
+                    if !non_uniform {
+                        return int(self, a);
+                    }
                     self.cross_lane(false)?;
                     let r = self.emulated_readfirstlane(a, guard)?;
                     return int(self, r);
