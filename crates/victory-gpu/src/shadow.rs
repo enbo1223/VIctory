@@ -233,14 +233,10 @@ impl Shadow {
                     // threads may write the other bytes meanwhile, and
                     // writing the whole piece would put back what they had
                     // before.
-                    for &(s, e) in &runs {
+                    if let (Some(&(s, _)), Some(&(_, e))) = (runs.first(), runs.last()) {
                         crate::watch::writing(start + at + s, e - s);
-                        crate::host::write_mapped(
-                            (start + at + s) as *mut u8,
-                            title[s..].as_ptr(),
-                            e - s,
-                        );
-                        written += e - s;
+                        crate::host::write_runs((start + at) as *mut u8, title.as_ptr(), &runs);
+                        written += runs.iter().map(|(s, e)| e - s).sum::<usize>();
                     }
                     synced.push((start + at) / PAGE);
                 }
@@ -533,7 +529,8 @@ mod copy_back_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+        VirtualFree, VirtualProtect,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
     const PAGES: usize = 64;
@@ -650,5 +647,28 @@ mod copy_back_tests {
         assert_eq!(peek(base + 8), 7, "in title memory");
         s.update(base, PAGE);
         assert_eq!(peek(s.data as usize + 8), 7, "in the copy");
+    }
+
+    /// Shaders wrote a page the title made read-only: copy-back leaves it
+    /// alone, as the kernel's write always did, where storing into it
+    /// directly would fault, and the other pages still get their bytes.
+    #[test]
+    fn a_read_only_title_page_is_left_alone() {
+        let title = Title::new();
+        let base = title.0;
+        let Some(s) = submitted(base) else {
+            return; // no host GPU here
+        };
+        let mut old = 0;
+        // SAFETY: inside the title memory.
+        let protected =
+            unsafe { VirtualProtect((base + 3 * PAGE) as *const _, PAGE, PAGE_READONLY, &mut old) };
+        assert_ne!(protected, 0);
+        s.copy_back(base, PAGES * PAGE);
+        assert_eq!(peek(base + 3 * PAGE), 0, "the read-only page");
+        assert!(
+            (0..PAGES).filter(|&p| p != 3).all(|p| peek(base + p * PAGE) == 1),
+            "the shader's bytes"
+        );
     }
 }

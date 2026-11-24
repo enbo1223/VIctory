@@ -1405,6 +1405,51 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
+/// Copies the `runs` of `src` (byte ranges, as offsets) to the same offsets
+/// from `dst` in title memory. Stores them directly when all of them lie in
+/// committed read-write memory, a single query: a call into the kernel per
+/// run cost over a second a frame in the world, where shaders' scattered
+/// writes make thousands of runs a piece. Otherwise each goes through
+/// [`write_mapped`], which leaves pages that are not mapped alone.
+pub(crate) fn write_runs(dst: *mut u8, src: *const u8, runs: &[(usize, usize)]) {
+    let (Some(&(first, _)), Some(&(_, end))) = (runs.first(), runs.last()) else {
+        return;
+    };
+    if writable(dst as usize + first, end - first) {
+        for &(s, e) in runs {
+            // SAFETY: the source is our host copy; the destination was
+            // committed read-write just above. A guarded block that is
+            // guarded again meanwhile faults into our handler, which opens
+            // it. shortcut: a title thread unmapping or protecting this
+            // memory between the query and the stores would crash us; the
+            // GPU's bytes go back before the title is told the submission is
+            // done, so only a title that frees memory the GPU still writes
+            // could.
+            unsafe { std::ptr::copy_nonoverlapping(src.add(s), dst.add(s), e - s) };
+        }
+    } else {
+        for &(s, e) in runs {
+            write_mapped(dst.wrapping_add(s), src.wrapping_add(s), e - s);
+        }
+    }
+}
+
+/// Whether all of `[at, at + len)` is committed read-write memory now.
+pub(crate) fn writable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    // The answer covers the pages from `at`'s that share its state.
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect == PAGE_READWRITE
+        && at.saturating_add(len) <= info.BaseAddress as usize + info.RegionSize
+}
+
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
 fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
