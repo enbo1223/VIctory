@@ -6958,11 +6958,11 @@ impl<'a> Lower<'a> {
                 return Err("a 16-bit image atomic");
             }
             // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            let is_64 = match (code == u32::MAX, *dmask) {
+                (false, 1) | (true, 3) => false,
+                (false, 3) | (true, 0xF) => true,
+                _ => return Err("an unsupported image atomic dmask"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -6971,8 +6971,81 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
+            let h = self.handle(
+                site,
+                src,
+                false,
+                (kind | 0x1000, if is_64 { 0x107 } else { 0x105 }),
+            )?;
+            let at = self.begin_guarded(guard);
+            if is_64 {
+                let i64t = self.s.m.int(64);
+                self.s.flags |= flags::INT64;
+                let pack64 = |s: &mut Self, lo: V, hi: V| {
+                    let lo = s.s.m.cast(c, Cast::ZExt, lo, i64t);
+                    let hi = s.s.m.cast(c, Cast::ZExt, hi, i64t);
+                    let k32 = s.s.m.int_const(i64t, 32);
+                    let hi = s.s.m.bin(c, Bin::Shl, hi, k32);
+                    s.s.m.bin(c, Bin::Or, lo, hi)
+                };
+                let old = if cache.glc {
+                    let lo = match inst.read(Reg::V(reg)) {
+                        Some(v) => self.i32_of(v)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let hi = match inst.read(Reg::V(reg + 1)) {
+                        Some(v) => self.i32_of(v)?,
+                        None => self.s.m.i32(0),
+                    };
+                    pack64(self, lo, hi)
+                } else {
+                    self.s.m.int_const(i64t, 0)
+                };
+                let vals = self.vgprs(inst, data, if code == u32::MAX { 4 } else { 2 })?;
+                let mut args = vec![h];
+                let op_res = if code == u32::MAX {
+                    // cmpswap: data is (new, compare).
+                    let new_val = pack64(self, vals[0], vals[1]);
+                    let cmp_val = pack64(self, vals[2], vals[3]);
+                    args.extend(cs);
+                    args.extend([cmp_val, new_val]);
+                    self.s.op(
+                        self.cur,
+                        "atomicCompareExchange.i64",
+                        Attr::NoUnwind,
+                        i64t,
+                        79,
+                        &args,
+                    )
+                } else {
+                    let mut value = pack64(self, vals[0], vals[1]);
+                    if op == "sub" {
+                        let z = self.s.m.int_const(i64t, 0);
+                        value = self.s.m.bin(c, Bin::Sub, z, value);
+                    }
+                    args.push(self.s.m.i32(code));
+                    args.extend(cs);
+                    args.push(value);
+                    self.s.op(
+                        self.cur,
+                        "atomicBinOp.i64",
+                        Attr::NoUnwind,
+                        i64t,
+                        78,
+                        &args,
+                    )
+                };
+                let res = self.end_guarded(at, &[(op_res, old)])[0];
+                if cache.glc {
+                    let (lo, hi) = self.split64(res);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                }
+                return Ok(());
+            }
             let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
             let mut value = vals[0];
+            let i32t = self.s.t.i32;
             if op == "sub" {
                 let z = self.s.m.i32(0);
                 value = self.s.m.bin(c, Bin::Sub, z, value);
@@ -6981,9 +7054,6 @@ impl<'a> Lower<'a> {
                 Some(v) if cache.glc => self.i32_of(v)?,
                 _ => self.s.m.i32(0),
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
-            let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
             let mut args = vec![h];
             let r = if code == u32::MAX {
                 // cmpswap: data is (new, compare).
@@ -8521,6 +8591,39 @@ mod tests {
             }]
         };
         lower_with(&words, layout(), used()).unwrap();
+    }
+
+    #[test]
+    fn image_atomic_64_bit_lowers_with_int64_feature() {
+        // Table address at s0 loaded into s[2:3], s_load_dwordx8 s[0:7], s[2:3], null
+        // then MIMG image_atomic_add v[0:1], v[2:3], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D
+        let words = [
+            0xBE82_0300, // s_mov_b32 s2, s0
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF40C_0001,
+            0xFA00_0000, // s_load_dwordx8 s[0:7], s[2:3], null
+            0xF044_0308,
+            0x0000_0002, // image_atomic_add v[0:1], v[2:3], s[0:7] dmask:0x3 dim:SQ_RSRC_IMG_2D
+            S_ENDPGM,
+        ];
+        let layout = || vec![root(RootType::Table, 0, 0)];
+        let used = || {
+            vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            }]
+        };
+        let l = lower_with(&words, layout(), used()).unwrap();
+        let container = crate::Container::parse(&l.dxil).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
+        let sfi0 = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_ne!(sfi0 & 0x8000, 0, "64-bit image atomic must declare INT64 feature");
     }
 
     /// Tables of 2D textures at s0 and samplers at s1.
