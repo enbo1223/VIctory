@@ -190,10 +190,11 @@ descriptor joins, live-first pipeline queues with 64 MB compiler stacks,
 64-bit image atomics, normalized MTBUF loads, scalar root-view loads,
 `image_gather4_l`, `image_sample_d_cl`, LDS write pairs and raw
 `SV_Barycentrics`. Together they cut the measured shader refusals in a 240 s
-world run from 531 to roughly 263, and `168` shader/GPU tests pass. The
-remaining refusals are concentrated in divergent `v_readfirstlane`, wave
-ballots, unknown structured-buffer strides, untracked lane-mask joins and
-root/SGPR addresses; each is named in the diagnostic log. `VICTORY_PRESENT_1440P=1`
+world run from 531 to 221, and `168` shader/GPU tests pass. The remaining
+refusals are concentrated in divergent `v_readfirstlane` (51), wave ballots
+(37), split-wave64 LDS fences (33), root/SGPR addresses (46), unknown
+structured-buffer strides (21) and untracked lane-mask joins (18); each is
+named in the diagnostic log. `VICTORY_PRESENT_1440P=1`
 keeps the presented world image stable: forcing 1920x1080 by resizing the
 window or presenting the color target directly crashes the title about 34 s
 into the world.
